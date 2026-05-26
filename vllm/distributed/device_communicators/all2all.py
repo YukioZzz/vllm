@@ -817,7 +817,21 @@ class MoriAll2AllManager(All2AllManagerBase):
                     warp_num_per_block = 16
         else:
             # multi node
-            kernel_type = mori.ops.EpDispatchCombineKernelType.InterNodeV1
+            #
+            # MoRI exposes two inter-node kernels: ``InterNodeV1`` (throughput-
+            # oriented, larger batches) and ``InterNodeV1LL`` (low-latency,
+            # tuned for small per-rank token counts).  Pick automatically
+            # based on ``max_num_tokens_per_dp_rank`` vs a configurable
+            # threshold (SGLang #18437); 256 matches the SGLang default.
+            import vllm.envs as envs
+
+            inter_kernel_switch_threshold = (
+                envs.VLLM_MORI_DISPATCH_INTER_KERNEL_SWITCH_THRESHOLD
+            )
+            if max_num_tokens_per_dp_rank <= inter_kernel_switch_threshold:
+                kernel_type = mori.ops.EpDispatchCombineKernelType.InterNodeV1LL
+            else:
+                kernel_type = mori.ops.EpDispatchCombineKernelType.InterNodeV1
             if on_gfx942():
                 warp_num_per_block = 16
                 block_num = 32

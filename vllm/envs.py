@@ -222,6 +222,7 @@ if TYPE_CHECKING:
     VLLM_MORIIO_NUM_WORKERS: int = 1
     VLLM_MORI_DISPATCH_DTYPE: str = "auto"
     VLLM_MORI_COMBINE_DTYPE: str = "auto"
+    VLLM_MORI_DISPATCH_INTER_KERNEL_SWITCH_THRESHOLD: int = 256
     VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT: int = 480
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
     VLLM_LOOPBACK_IP: str = ""
@@ -1671,6 +1672,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # SGLang #24879). ``auto`` follows the dispatch auto-detect logic.
     "VLLM_MORI_COMBINE_DTYPE": lambda: os.getenv(
         "VLLM_MORI_COMBINE_DTYPE", "auto"
+    ),
+    # Threshold for selecting the inter-node MoRI dispatch kernel (matches
+    # SGLang #18437).  When ``max_num_tokens_per_dp_rank`` is <= this
+    # threshold, the low-latency ``InterNodeV1LL`` kernel is used; otherwise
+    # the throughput-oriented ``InterNodeV1`` kernel is used.  Defaults to
+    # 256, the SGLang-tuned crossover point.
+    "VLLM_MORI_DISPATCH_INTER_KERNEL_SWITCH_THRESHOLD": lambda: int(
+        os.getenv("VLLM_MORI_DISPATCH_INTER_KERNEL_SWITCH_THRESHOLD", "256")
     ),
     # Timeout (in seconds) for MooncakeConnector in PD disaggregated setup.
     "VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT": lambda: int(
