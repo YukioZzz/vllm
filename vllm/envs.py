@@ -220,6 +220,8 @@ if TYPE_CHECKING:
     VLLM_MORIIO_QP_PER_TRANSFER: int = 1
     VLLM_MORIIO_POST_BATCH_SIZE: int = -1
     VLLM_MORIIO_NUM_WORKERS: int = 1
+    VLLM_MORI_DISPATCH_DTYPE: str = "auto"
+    VLLM_MORI_COMBINE_DTYPE: str = "auto"
     VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT: int = 480
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
     VLLM_LOOPBACK_IP: str = ""
@@ -1656,6 +1658,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Controls the number of workers for Mori operations for the Mori-IO connector
     "VLLM_MORIIO_NUM_WORKERS": lambda: int(os.getenv("VLLM_MORIIO_NUM_WORKERS", "1")),
+    # Activation dtype used by the MoRI EP dispatcher (rank-to-rank send).
+    # One of: auto | bf16 | fp8 | fp4. ``auto`` selects the dtype based on
+    # the model's weight quantization (FP4 weights -> fp4 dispatch,
+    # FP8 block-quant weights -> fp8 dispatch, otherwise bf16).
+    "VLLM_MORI_DISPATCH_DTYPE": lambda: os.getenv(
+        "VLLM_MORI_DISPATCH_DTYPE", "auto"
+    ),
+    # Activation dtype used by the MoRI EP combine (rank-to-rank reduce).
+    # One of: auto | bf16 | fp8 | fp8_direct_cast. ``fp8`` selects MoRI's
+    # block-scaled FP8 combine (recommended for MXFP4 models, matches
+    # SGLang #24879). ``auto`` follows the dispatch auto-detect logic.
+    "VLLM_MORI_COMBINE_DTYPE": lambda: os.getenv(
+        "VLLM_MORI_COMBINE_DTYPE", "auto"
+    ),
     # Timeout (in seconds) for MooncakeConnector in PD disaggregated setup.
     "VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT": lambda: int(
         os.getenv("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", "480")

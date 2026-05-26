@@ -789,6 +789,7 @@ class MoriAll2AllManager(All2AllManagerBase):
         max_num_tokens_per_dp_rank: int,
         num_local_experts: int,
         num_experts_per_token: int,
+        combine_quant_type: str = "none",
     ):
         import mori  # type: ignore[import-not-found]
 
@@ -804,6 +805,16 @@ class MoriAll2AllManager(All2AllManagerBase):
             rdma_block_num = 0
             warp_num_per_block = 16
             block_num = 80
+            # FP4 dispatch favors a higher-occupancy IntraNode launch shape;
+            # mirror the SGLang MoRI FP4 tuning (#19757) so packed payloads
+            # reach close to peak XGMI bandwidth on small-batch decode.
+            if quant_dtype == torch.float4_e2m1fn_x2:
+                if max_num_tokens_per_dp_rank < 128:
+                    block_num = 225
+                    warp_num_per_block = 5
+                else:
+                    block_num = 256
+                    warp_num_per_block = 16
         else:
             # multi node
             kernel_type = mori.ops.EpDispatchCombineKernelType.InterNodeV1
@@ -836,6 +847,7 @@ class MoriAll2AllManager(All2AllManagerBase):
             kernel_type=kernel_type,
             rdma_block_num=rdma_block_num,
             gpu_per_node=min(8, num_ep_ranks),
+            quant_type=combine_quant_type,
         )
 
     def _make_handle(self, **kwargs):

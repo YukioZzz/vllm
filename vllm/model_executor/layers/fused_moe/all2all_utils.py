@@ -196,40 +196,118 @@ def maybe_make_prepare_finalize(
     elif moe.use_mori_kernels:
         assert quant_config is not None
 
-        # Note: We may want to use FP8 dispatch just to reduce
-        # data movement.
-        use_fp8_dispatch = (
-            quant_config.is_per_act_token or quant_config.is_block_quantized
+        import vllm.envs as envs
+        from vllm.model_executor.layers.fused_moe.prepare_finalize.mori import (
+            FP8_BLOCK_SIZE,
+            MXFP4_BLOCK_SIZE,
+            CombineDtype,
+            DispatchDtype,
+            combine_dtype_to_mori_quant_type,
         )
-        if use_fp8_dispatch:
-            # For PTPC (per token per channel) quant, scale dim is 1
-            # For 1x128 quant, scale dim is hidden_dim // 128
-            quant_dtype = quant_config.quant_dtype
-            scale_dim = 1 if quant_config.is_per_act_token else moe.hidden_dim // 128
+
+        # Pick default dispatch / combine dtypes based on weight quantization,
+        # matching SGLang's MoRI auto-detect:
+        #   * FP4 weights  -> FP4 dispatch + FP8 blockwise combine
+        #   * FP8 weights  -> FP8 dispatch + BF16 combine (existing behavior)
+        #   * BF16 weights -> BF16 dispatch + BF16 combine (no quant)
+        weight_dtype = quant_config.quant_dtype
+        if weight_dtype == torch.float4_e2m1fn_x2 or weight_dtype == "mxfp4":
+            dispatch_dtype = DispatchDtype.fp4
+            combine_dtype = CombineDtype.fp8
+        elif quant_config.is_per_act_token or quant_config.is_block_quantized:
+            dispatch_dtype = DispatchDtype.fp8
+            combine_dtype = CombineDtype.bf16
         else:
-            # Unquantized dispatch (e.g. AITER with defer_input_quant):
-            # dispatch raw BF16/FP16 data, no scales needed.
+            dispatch_dtype = DispatchDtype.bf16
+            combine_dtype = CombineDtype.bf16
+
+        # Allow explicit override via env var.
+        env_dispatch = (envs.VLLM_MORI_DISPATCH_DTYPE or "auto").lower()
+        if env_dispatch != "auto":
+            try:
+                dispatch_dtype = {
+                    "bf16": DispatchDtype.bf16,
+                    "fp8": DispatchDtype.fp8,
+                    "fp4": DispatchDtype.fp4,
+                }[env_dispatch]
+            except KeyError:
+                logger.warning_once(
+                    "VLLM_MORI_DISPATCH_DTYPE=%s is not supported "
+                    "(use auto|bf16|fp8|fp4); ignoring.",
+                    env_dispatch,
+                )
+
+        env_combine = (envs.VLLM_MORI_COMBINE_DTYPE or "auto").lower()
+        if env_combine != "auto":
+            try:
+                combine_dtype = {
+                    "bf16": CombineDtype.bf16,
+                    "fp8": CombineDtype.fp8,
+                    "fp8_direct_cast": CombineDtype.fp8_direct_cast,
+                }[env_combine]
+            except KeyError:
+                logger.warning_once(
+                    "VLLM_MORI_COMBINE_DTYPE=%s is not supported "
+                    "(use auto|bf16|fp8|fp8_direct_cast); ignoring.",
+                    env_combine,
+                )
+
+        # Translate dispatch_dtype into the MoRI ``data_type`` / ``scale_dim``
+        # / ``scale_type_size`` fields.
+        if dispatch_dtype == DispatchDtype.fp8:
+            quant_dtype = current_platform.fp8_dtype()
+            # PTPC (per-token-per-channel) -> scale_dim 1; 1x128 block -> /128
+            scale_dim = (
+                1 if quant_config.is_per_act_token else moe.hidden_dim // FP8_BLOCK_SIZE
+            )
+            scale_type_size = torch.float32.itemsize
+        elif dispatch_dtype == DispatchDtype.fp4:
+            # MoRI's FP4 path keeps the unpacked hidden size and packs in-kernel
+            # so we can compute scale_dim from the original hidden_dim. Each
+            # 32-elem MXFP4 group shares one float8_e8m0fnu exponent.
+            quant_dtype = torch.float4_e2m1fn_x2
+            scale_dim = moe.hidden_dim // MXFP4_BLOCK_SIZE
+            scale_type_size = torch.float8_e8m0fnu.itemsize
+        else:
+            # BF16/FP16 dispatch (e.g. AITER with defer_input_quant): dispatch
+            # raw activations without scales.
             quant_dtype = moe.in_dtype
             scale_dim = 0
+            scale_type_size = 0
+
+        combine_quant_type = combine_dtype_to_mori_quant_type(combine_dtype)
+
         all_to_all_args = dict(
             rank=all2all_manager.rank,
             num_ep_ranks=all2all_manager.world_size,
             quant_dtype=quant_dtype,
             token_hidden_size=moe.hidden_dim,
             scale_dim=scale_dim,
-            scale_type_size=0 if scale_dim == 0 else torch.float32.itemsize,
+            scale_type_size=scale_type_size,
             max_num_tokens_per_dp_rank=moe.max_num_tokens,
             input_dtype=moe.in_dtype,
             num_local_experts=moe.num_experts // all2all_manager.world_size,
             num_experts_per_token=moe.experts_per_token,
+            combine_quant_type=combine_quant_type,
         )
         handle = all2all_manager.get_handle(all_to_all_args)
+
+        logger.info_once(
+            "MoRI EP prepare/finalize: dispatch_dtype=%s combine_dtype=%s "
+            "scale_dim=%d combine_quant_type=%s",
+            dispatch_dtype.value,
+            combine_dtype.value,
+            scale_dim,
+            combine_quant_type,
+        )
 
         prepare_finalize = MoriPrepareAndFinalize(
             handle,
             max_tokens_per_rank=moe.max_num_tokens,
             num_dispatchers=all2all_manager.world_size,
-            use_fp8_dispatch=use_fp8_dispatch,
+            dispatch_dtype=dispatch_dtype,
+            combine_dtype=combine_dtype,
+            hidden_size=moe.hidden_dim,
         )
 
     elif moe.use_fi_nvl_two_sided_kernels:
