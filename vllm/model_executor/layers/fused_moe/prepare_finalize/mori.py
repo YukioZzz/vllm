@@ -45,6 +45,80 @@ def combine_dtype_to_mori_quant_type(combine_dtype: "CombineDtype") -> str:
     return "none"
 
 
+def pick_mori_dispatch_combine_dtypes(
+    weight_quant_dtype,
+    *,
+    dispatch_override: str = "auto",
+    combine_override: str = "auto",
+) -> tuple["DispatchDtype", "CombineDtype"]:
+    """Pick the MoRI EP dispatch / combine activation dtypes from the
+    *post-loaded* weight quantization dtype, honoring env-style overrides.
+
+    Mirrors SGLang #21040: detect from the WEIGHT dtype (``_w1.dtype``)
+    rather than the activation quant dtype (``_a1.dtype``).  The latter is
+    misleading for mixed-precision MoE schemes such as W4A8 MXFP4 where
+    ``activation=fp8`` but ``weights=mxfp4`` -- we must dispatch FP4.
+
+    Accepts both the legacy string forms (``"mxfp4"``, ``"fp8"``) and the
+    corresponding torch dtypes (``torch.float4_e2m1fn_x2``,
+    ``torch.float8_e4m3fn``, ``torch.float8_e4m3fnuz``).
+
+    ``dispatch_override`` / ``combine_override`` are the env-var values
+    (``auto`` / ``bf16`` / ``fp8`` / ``fp4`` / ``fp8_direct_cast``).  An
+    invalid override logs a warning and the auto-detected value is kept.
+    """
+    fp4_dtypes: tuple = ("mxfp4",)
+    if hasattr(torch, "float4_e2m1fn_x2"):
+        fp4_dtypes = fp4_dtypes + (torch.float4_e2m1fn_x2,)
+    fp8_dtypes: tuple = (
+        "fp8",
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+    )
+
+    if weight_quant_dtype in fp4_dtypes:
+        dispatch_dtype = DispatchDtype.fp4
+        combine_dtype = CombineDtype.fp8
+    elif weight_quant_dtype in fp8_dtypes:
+        dispatch_dtype = DispatchDtype.fp8
+        combine_dtype = CombineDtype.bf16
+    else:
+        dispatch_dtype = DispatchDtype.bf16
+        combine_dtype = CombineDtype.bf16
+
+    if dispatch_override and dispatch_override.lower() != "auto":
+        mapping = {
+            "bf16": DispatchDtype.bf16,
+            "fp8": DispatchDtype.fp8,
+            "fp4": DispatchDtype.fp4,
+        }
+        try:
+            dispatch_dtype = mapping[dispatch_override.lower()]
+        except KeyError:
+            logger.warning_once(
+                "VLLM_MORI_DISPATCH_DTYPE=%s is not supported "
+                "(use auto|bf16|fp8|fp4); ignoring.",
+                dispatch_override,
+            )
+
+    if combine_override and combine_override.lower() != "auto":
+        mapping_c = {
+            "bf16": CombineDtype.bf16,
+            "fp8": CombineDtype.fp8,
+            "fp8_direct_cast": CombineDtype.fp8_direct_cast,
+        }
+        try:
+            combine_dtype = mapping_c[combine_override.lower()]
+        except KeyError:
+            logger.warning_once(
+                "VLLM_MORI_COMBINE_DTYPE=%s is not supported "
+                "(use auto|bf16|fp8|fp8_direct_cast); ignoring.",
+                combine_override,
+            )
+
+    return dispatch_dtype, combine_dtype
+
+
 class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     """Prepare/Finalize using MoRI kernels.
 

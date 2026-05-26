@@ -203,54 +203,19 @@ def maybe_make_prepare_finalize(
             CombineDtype,
             DispatchDtype,
             combine_dtype_to_mori_quant_type,
+            pick_mori_dispatch_combine_dtypes,
         )
 
-        # Pick default dispatch / combine dtypes based on weight quantization,
-        # matching SGLang's MoRI auto-detect:
-        #   * FP4 weights  -> FP4 dispatch + FP8 blockwise combine
-        #   * FP8 weights  -> FP8 dispatch + BF16 combine (existing behavior)
-        #   * BF16 weights -> BF16 dispatch + BF16 combine (no quant)
-        weight_dtype = quant_config.quant_dtype
-        if weight_dtype == torch.float4_e2m1fn_x2 or weight_dtype == "mxfp4":
-            dispatch_dtype = DispatchDtype.fp4
-            combine_dtype = CombineDtype.fp8
-        elif quant_config.is_per_act_token or quant_config.is_block_quantized:
-            dispatch_dtype = DispatchDtype.fp8
-            combine_dtype = CombineDtype.bf16
-        else:
-            dispatch_dtype = DispatchDtype.bf16
-            combine_dtype = CombineDtype.bf16
-
-        # Allow explicit override via env var.
-        env_dispatch = (envs.VLLM_MORI_DISPATCH_DTYPE or "auto").lower()
-        if env_dispatch != "auto":
-            try:
-                dispatch_dtype = {
-                    "bf16": DispatchDtype.bf16,
-                    "fp8": DispatchDtype.fp8,
-                    "fp4": DispatchDtype.fp4,
-                }[env_dispatch]
-            except KeyError:
-                logger.warning_once(
-                    "VLLM_MORI_DISPATCH_DTYPE=%s is not supported "
-                    "(use auto|bf16|fp8|fp4); ignoring.",
-                    env_dispatch,
-                )
-
-        env_combine = (envs.VLLM_MORI_COMBINE_DTYPE or "auto").lower()
-        if env_combine != "auto":
-            try:
-                combine_dtype = {
-                    "bf16": CombineDtype.bf16,
-                    "fp8": CombineDtype.fp8,
-                    "fp8_direct_cast": CombineDtype.fp8_direct_cast,
-                }[env_combine]
-            except KeyError:
-                logger.warning_once(
-                    "VLLM_MORI_COMBINE_DTYPE=%s is not supported "
-                    "(use auto|bf16|fp8|fp8_direct_cast); ignoring.",
-                    env_combine,
-                )
+        # Pick default dispatch / combine dtypes from the loaded WEIGHT
+        # quantization dtype (matches SGLang #21040's auto-detect; helper
+        # encapsulates the table + env-var override semantics so it is
+        # directly unit-testable).
+        weight_dtype = quant_config.weight_quant_dtype
+        dispatch_dtype, combine_dtype = pick_mori_dispatch_combine_dtypes(
+            weight_dtype,
+            dispatch_override=envs.VLLM_MORI_DISPATCH_DTYPE or "auto",
+            combine_override=envs.VLLM_MORI_COMBINE_DTYPE or "auto",
+        )
 
         # Translate dispatch_dtype into the MoRI ``data_type`` / ``scale_dim``
         # / ``scale_type_size`` fields.
@@ -293,8 +258,9 @@ def maybe_make_prepare_finalize(
         handle = all2all_manager.get_handle(all_to_all_args)
 
         logger.info_once(
-            "MoRI EP prepare/finalize: dispatch_dtype=%s combine_dtype=%s "
-            "scale_dim=%d combine_quant_type=%s",
+            "MoRI EP prepare/finalize: weight_dtype=%s dispatch_dtype=%s "
+            "combine_dtype=%s scale_dim=%d combine_quant_type=%s",
+            weight_dtype,
             dispatch_dtype.value,
             combine_dtype.value,
             scale_dim,
