@@ -560,8 +560,16 @@ def fused_recurrent_kda_packed_decode(
         raise ValueError("`raw_beta` heads must be contiguous.")
     if initial_state.stride()[1:] != (V * K, K, 1):
         raise ValueError("`initial_state` must be contiguous within each cache slot.")
-    if state_indices.ndim != 1 or state_indices.stride(0) != 1:
-        raise ValueError("`state_indices` must be contiguous and one-dimensional.")
+    if state_indices.ndim != 1 or (
+        state_indices.numel() > 1 and state_indices.stride(0) != 1
+    ):
+        # A single-element index (numel<=1) is trivially contiguous even if it
+        # inherits a >1 stride from a parent 2-D metadata tensor (the kernel only
+        # reads offset 0), so only enforce unit stride for multi-element indices.
+        raise ValueError(
+            "`state_indices` must be contiguous and one-dimensional. got "
+            f"shape={tuple(state_indices.shape)} stride={tuple(state_indices.stride())}"
+        )
     if A_log.ndim != 1 or not A_log.is_contiguous():
         raise ValueError("`A_log` must be contiguous and one-dimensional.")
     if not dt_bias.is_contiguous():
