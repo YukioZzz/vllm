@@ -1105,6 +1105,7 @@ def is_kv_cache_type_attention_free(kv_cache_spec: dict[str, KVCacheSpec]) -> bo
 
 def _get_kv_cache_groups_uniform_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
+    vllm_config: "VllmConfig | None" = None,
 ) -> list[KVCacheGroupSpec]:
     """
     Generates the KV cache groups for hybrid models with multiple
@@ -1208,9 +1209,31 @@ def _get_kv_cache_groups_uniform_page_size(
     # is the minimum number of layers among all attention types. Need a better
     # strategy if we want to support more complex patterns (e.g., 20 full + 30
     # sw, where the group size should be 10).
-    min_num_layers = min([len(layers) for layers in layer_buckets])
+    bucket_sizes = [len(layers) for layers in layer_buckets]
+    max_num_layers = max(bucket_sizes)
+    # Under speculative decoding, a drafter can introduce an attention type with
+    # far fewer layers than the main model (e.g. an MLA-only draft attached to a
+    # hybrid mamba/attention target). Such a tiny bucket would otherwise shrink
+    # ``group_size`` down to its own size and over-split the main model's
+    # layers; for hybrid models this also makes the decode engine (with the
+    # drafter) group its mamba layers differently from the prefill engine
+    # (without it), breaking PD-disaggregated KV transfer. Because these
+    # auxiliary layers are few, padding them up to the main group size costs
+    # negligible memory, so exclude them when choosing the group size. This
+    # extends the single-type drafter accommodation below to drafters that add a
+    # *new* small attention type, and is gated on speculative decoding so
+    # non-spec models are unaffected.
+    primary_sizes = bucket_sizes
+    if (
+        vllm_config is not None
+        and vllm_config.speculative_config is not None
+        and len(bucket_sizes) > 1
+    ):
+        primary_sizes = [s for s in bucket_sizes if s * 4 > max_num_layers] or (
+            bucket_sizes
+        )
+    min_num_layers = min(primary_sizes)
     group_size = min_num_layers
-    max_num_layers = max([len(layers) for layers in layer_buckets])
     if max_num_layers < min_num_layers * 1.5:
         # If the number of layers is not much larger than the minimum number of
         # layers, use the maximum number of layers as the group size to avoid
@@ -1804,7 +1827,7 @@ def get_kv_cache_groups(
         if fallback_groups is None:
             raise
         return fallback_groups
-    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
+    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec, vllm_config)
 
     # Add hidden-state layers back with page aligned to the common page.
     if hidden_specs:
