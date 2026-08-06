@@ -438,11 +438,9 @@ class MLAAttentionSpec(FullAttentionSpec):
             len(cache_dtype_str_set) == 1
             and len(compress_ratio_set) == 1
             and len(model_version_set) == 1
-            and len(block_stride_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
-            "quantization method, compress ratio, model version, and KV block "
-            "stride indexing."
+            "quantization method, compress ratio, and model version."
         )
         merged_spec = cls(
             block_size=specs[0].block_size,
@@ -451,7 +449,12 @@ class MLAAttentionSpec(FullAttentionSpec):
             dtype=specs[0].dtype,
             kv_quant_mode=specs[0].kv_quant_mode,
             page_size_padded=specs[0].page_size_padded,
-            indexes_kv_by_block_stride=block_stride_set.pop(),
+            # indexes_kv_by_block_stride is a backend capability -- "can this
+            # backend read a padded page back through a strided view" -- not a
+            # property of the page, so it must not force layers apart. Combine
+            # conservatively: the group may only be padded if every member
+            # backend can read a padded page. See the note below.
+            indexes_kv_by_block_stride=all(block_stride_set),
             cache_dtype_str=cache_dtype_str_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
@@ -461,6 +464,9 @@ class MLAAttentionSpec(FullAttentionSpec):
         )
         for spec in specs:
             for f in fields(AttentionSpec):
+                if f.name == "indexes_kv_by_block_stride":
+                    # Combined above rather than required to match.
+                    continue
                 assert getattr(spec, f.name) == getattr(merged_spec, f.name), (
                     "All attention layers in the same KV cache group must have "
                     "the same attention spec."
