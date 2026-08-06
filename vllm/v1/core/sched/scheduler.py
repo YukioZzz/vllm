@@ -2782,8 +2782,26 @@ class Scheduler(SchedulerInterface):
             is_affected = False
             marked_invalid_block = False
             req_id = request.request_id
-            # TODO (davidb): add support for hybrid memory allocator
-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
+            # Hybrid models (e.g. Kimi-K3: MLA attention + KDA recurrent state)
+            # return one block-id list per KV-cache group, so the single-group
+            # unpack this used to do raised ValueError from update_from_output on
+            # the EngineCore thread -- turning a KV load failure the scheduler
+            # can recover from by recomputing the affected prefix into a dead
+            # engine. Block ids come from one shared pool and are therefore
+            # unique across groups, so the only group that can matter here is
+            # the one that actually holds an invalid block.
+            req_block_id_groups = self.kv_cache_manager.get_block_ids(req_id)
+            if len(req_block_id_groups) == 1:
+                (req_block_ids,) = req_block_id_groups
+            else:
+                req_block_ids = next(
+                    (
+                        group
+                        for group in req_block_id_groups
+                        if not invalid_block_ids.isdisjoint(group)
+                    ),
+                    [],
+                )
             # We iterate only over blocks that may contain externally computed
             # tokens
             req_num_computed_tokens = (
