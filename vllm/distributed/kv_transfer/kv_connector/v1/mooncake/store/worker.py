@@ -126,32 +126,59 @@ def _diag_sample_placement(
     if st["puts"] % every:
         return
 
-    desc: Any = None
+    # ReplicaDescriptor has no __repr__, so matching on repr() always failed and every
+    # sample was miscounted as "other". The real chain, from the pybind definitions, is
+    #   get_replica_desc(key) -> [ReplicaDescriptor]
+    #   rd.is_memory_replica() / rd.get_memory_descriptor().buffer_descriptor
+    #   -> Descriptor(size, buffer_address, transport_endpoint)
+    # transport_endpoint is the owning process's transfer-engine ip:port. That is exactly
+    # what Mooncake's own isSameProcessEndpoint() compares to decide between LOCAL_MEMCPY
+    # and going out over TCP, so it is the right field to judge locality by -- and it is a
+    # process identity, not a segment name, so compare it against our own endpoint rather
+    # than against preferred_segment.
+    endpoint: str | None = None
     try:
-        getter = getattr(store, "get_replica_desc", None)
-        if getter is None:
-            st["unknown"] += 1
-            return
-        desc = getter(keys[0])
+        descs = store.get_replica_desc(keys[0])
+        for rd in descs or ():
+            if not getattr(rd, "is_memory_replica", lambda: False)():
+                continue
+            mem = rd.get_memory_descriptor()
+            buf = getattr(mem, "buffer_descriptor", None)
+            ep = getattr(buf, "transport_endpoint", None)
+            if ep:
+                endpoint = str(ep)
+                break
     except Exception:
+        if not st["shape_logged"]:
+            st["shape_logged"] = True
+            logger.exception("[mc-diag] could not introspect the replica descriptor")
         st["unknown"] += 1
         return
 
-    # The descriptor's shape is not documented in the Python binding, so match on the
-    # segment name as a substring and log one raw sample so the real shape is on record.
-    text = repr(desc)
+    own_ep = st.get("own_endpoint")
+    if own_ep is None:
+        try:
+            own_ep = str(store.get_hostname())
+        except Exception:
+            own_ep = ""
+        st["own_endpoint"] = own_ep
+
     if not st["shape_logged"]:
         st["shape_logged"] = True
+        # Log both identities once: get_hostname() and te_endpoint may not share a port
+        # space, and if they do not, the comparison below has to be revisited.
         logger.info(
-            "[mc-diag] replica desc sample for key=%s own_segment=%s desc=%s",
+            "[mc-diag] key=%s holder_endpoint=%s own_endpoint=%s preferred_segment=%s",
             keys[0][:80],
+            endpoint or "<none>",
+            own_ep or "<none>",
             preferred_segment or "<none>",
-            text[:400],
         )
-    if preferred_segment and preferred_segment in text:
-        st["own"] += 1
-    elif desc is None or not text or text in ("None", "[]", "()"):
+
+    if endpoint is None:
         st["unknown"] += 1
+    elif own_ep and endpoint == own_ep:
+        st["own"] += 1
     else:
         st["other"] += 1
 
@@ -161,13 +188,13 @@ def _diag_sample_placement(
         sampled = st["own"] + st["other"] + st["unknown"]
         logger.info(
             "[mc-diag] placement: puts=%d sampled=%d own=%d other=%d unknown=%d "
-            "own_segment=%s",
+            "own_endpoint=%s",
             st["puts"],
             sampled,
             st["own"],
             st["other"],
             st["unknown"],
-            preferred_segment or "<none>",
+            st.get("own_endpoint") or "<none>",
         )
 
 
