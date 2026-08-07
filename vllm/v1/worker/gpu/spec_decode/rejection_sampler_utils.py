@@ -894,6 +894,30 @@ def rejection_sample(
     )
     num_reqs = cu_num_logits.shape[0] - 1
     num_logits, vocab_size = target_logits.shape
+
+    if num_logits == 0 or num_reqs == 0:
+        # Nothing to sample this step. Every kernel below is launched on a grid
+        # derived from num_logits or num_reqs, so going on hands Triton a zero-size
+        # grid and the GPU queue aborts:
+        #   rocdevice.cpp: HSA_STATUS_ERROR_EXCEPTION ... code: 0x1016
+        # taking the worker process with it, signalled rather than raised, so no
+        # Python frame survives to say why.
+        #
+        # Reproducible in isolation at num_reqs=1 with an empty request, for every
+        # draft_sample_method x rejection_sample_method combination; a zero-length
+        # request alongside a non-empty one is fine, it is specifically the batch
+        # having no logits at all. In service this needs speculative decoding (only
+        # then is this sampler called) together with a KV offload tier that can
+        # satisfy nearly a whole prompt, which leaves steps where every scheduled
+        # request is mid-prefill with no position to sample.
+        #
+        # No token was sampled for anyone, which num_sampled == 0 already says.
+        sampled = draft_sampled.new_zeros(
+            (num_reqs, num_speculative_steps + 1), dtype=torch.int64
+        )
+        num_sampled = draft_sampled.new_zeros((num_reqs,), dtype=torch.int32)
+        return sampled, num_sampled
+
     draft_logits_stride_0 = 0
     draft_logits_stride_1 = 0
     if has_draft_logits := draft_logits is not None:
