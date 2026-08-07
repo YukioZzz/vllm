@@ -533,6 +533,15 @@ def _rejection_kernel(
     req_state_idx = tl.load(idx_mapping_ptr + req_idx).to(tl.int64)
     start_idx = tl.load(cu_num_logits_ptr + req_idx).to(tl.int64)
     end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
+    if end_idx <= start_idx:
+        # A request can reach the sampler with no positions to sample, e.g. when the
+        # cache served its whole prompt. Zero its outputs instead of falling through
+        # to row start_idx, which belongs to the next request -- or to no one at all
+        # when the empty request is the last in the batch.
+        tl.store(rejected_steps_ptr + req_idx, 0)
+        tl.store(target_rejected_logsumexp_ptr + req_idx, 0.0)
+        tl.store(draft_rejected_logsumexp_ptr + req_idx, 0.0)
+        return
     num_draft_tokens = end_idx - start_idx - 1
     seed = tl.load(seed_ptr + req_state_idx)
     temp = tl.load(temp_ptr + req_state_idx).to(tl.float32)
@@ -713,6 +722,10 @@ def _resample_kernel(
     resample_idx = tl.load(rejected_step_ptr + req_idx)
     start_idx = tl.load(cu_num_logits_ptr + req_idx).to(tl.int64)
     end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
+    if end_idx <= start_idx:
+        # No sampling positions, so nothing to resample. Without this, is_bonus is
+        # False and the loads below index one row past the request's own range.
+        return
     resample_token_idx = start_idx + resample_idx
     req_state_idx = tl.load(expanded_idx_mapping_ptr + resample_token_idx).to(tl.int64)
 
