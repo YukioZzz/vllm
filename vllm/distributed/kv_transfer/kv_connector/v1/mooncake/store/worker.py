@@ -1442,9 +1442,30 @@ class MooncakeStoreWorker:
         seen_ptrs: set[int] = set()
         addrs: list[int] = []
         block_lens: list[int] = []
+        # Diagnostic only (no behaviour change). Every group's ChunkedTokenDatabase
+        # is handed the SAME flat address list below, so with more than one group
+        # the groups alias each other's KV bytes: each keeps its own Mooncake key
+        # namespace (group:{g_idx}) but every put/get lands on all the segments.
+        # On Kimi-K3 this is num_groups=4 sharing num_segments=29, and it is the
+        # only path that explains why the run dies exactly when the store starts
+        # serving hits (conc 1 sees 0.8% external hits and never faults, conc >= 8
+        # sees 50-92% and dies within minutes).
+        # Whether that can be fixed by slicing the list per group depends on
+        # whether any single storage is shared by layers of different groups --
+        # which is what this logs.
+        _layer_to_group: dict[str, int] = {}
+        for _g_idx, _g in enumerate(self._kv_cache_groups):
+            for _ln in getattr(_g, "layer_names", ()) or ():
+                _layer_to_group[_ln] = _g_idx
+        _storage_groups: dict[int, set[int]] = {}
+        _group_segment_counts: dict[int, int] = {}
 
-        for value in kv_caches.values():
+        for layer_name, value in kv_caches.items():
             cache = _repr_tensor(value)
+            _ptr = cache.untyped_storage().data_ptr()
+            _g = _layer_to_group.get(layer_name)
+            if _g is not None:
+                _storage_groups.setdefault(_ptr, set()).add(_g)
             cache_storage = cache.untyped_storage()
             base_addr = cache_storage.data_ptr()
             if base_addr in seen_ptrs:
@@ -1474,12 +1495,16 @@ class MooncakeStoreWorker:
                 # Blocks-first layout (FlashInfer / MLA): one segment.
                 addrs.append(base_addr)
                 block_lens.append(page_size_bytes)
+                _n_new = 1
             else:
                 # K/V-first layout (FlashAttn / ROCm): split segments.
                 seg_stride = cache.stride(outer_dims[0]) * el
                 for idx in range(cache.shape[outer_dims[0]]):
                     addrs.append(base_addr + idx * seg_stride)
                     block_lens.append(seg_stride // self.num_blocks)
+                _n_new = cache.shape[outer_dims[0]]
+            if _g is not None:
+                _group_segment_counts[_g] = _group_segment_counts.get(_g, 0) + _n_new
 
         logger.info(
             "Registered KV caches: num_groups=%d, num_segments=%d, num_blocks=%d",
@@ -1487,6 +1512,24 @@ class MooncakeStoreWorker:
             len(addrs),
             self.num_blocks,
         )
+        if len(self.token_dbs) > 1:
+            _shared = {p: g for p, g in _storage_groups.items() if len(g) > 1}
+            logger.warning(
+                "Mooncake store with %d KV-cache groups shares ONE %d-segment "
+                "address list across every group, so the groups alias each other's "
+                "KV bytes. segments owned per group=%s, layers mapped=%d/%d, "
+                "storages spanning multiple groups=%d%s",
+                len(self.token_dbs),
+                len(addrs),
+                dict(sorted(_group_segment_counts.items())),
+                len(_layer_to_group),
+                len(kv_caches),
+                len(_shared),
+                ""
+                if not _shared
+                else " (cannot be fixed by slicing the list per group: at least one "
+                "storage is shared by layers of different groups)",
+            )
 
         for db in self.token_dbs:
             db.set_kv_caches_base_addr(addrs)
