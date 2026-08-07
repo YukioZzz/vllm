@@ -88,6 +88,89 @@ MOONCAKE_NO_AVAILABLE_HANDLE = -200
 _T = TypeVar("_T")
 
 
+# --- placement diagnostic ---------------------------------------------------------
+# MOONCAKE_DIAG_REPLICA_SAMPLE=N samples one key out of every N successful puts and asks
+# the store which segment actually holds it, then compares that against this rank's own
+# segment name.
+#
+# The question it answers: is preferred_segment a hard guarantee or a soft hint? Pinning
+# each rank to its own segment took the decode node's loopback receive from 1217 GB to
+# 18 GB, but the prefill node only fell from 901 GB to 115 GB, still peaking at
+# 11.3 GB/s -- a rate only bulk KV can produce. If puts silently fall back to other
+# ranks' segments once the preferred one is under pressure, that is the explanation, and
+# affinity alone cannot be relied on. A nonzero "other" count proves fallback.
+#
+# Diagnostic only, off unless the env var is set, and every failure is swallowed: it must
+# never be able to break a run it was added to observe.
+_DIAG_STATE: dict[str, Any] = {
+    "puts": 0,
+    "own": 0,
+    "other": 0,
+    "unknown": 0,
+    "last_log": 0.0,
+    "shape_logged": False,
+}
+
+
+def _diag_sample_placement(
+    store: Any, keys: list[str], preferred_segment: str | None
+) -> None:
+    try:
+        every = int(os.environ.get("MOONCAKE_DIAG_REPLICA_SAMPLE", "0") or 0)
+    except ValueError:
+        return
+    if every <= 0 or not keys:
+        return
+    st = _DIAG_STATE
+    st["puts"] += 1
+    if st["puts"] % every:
+        return
+
+    desc: Any = None
+    try:
+        getter = getattr(store, "get_replica_desc", None)
+        if getter is None:
+            st["unknown"] += 1
+            return
+        desc = getter(keys[0])
+    except Exception:
+        st["unknown"] += 1
+        return
+
+    # The descriptor's shape is not documented in the Python binding, so match on the
+    # segment name as a substring and log one raw sample so the real shape is on record.
+    text = repr(desc)
+    if not st["shape_logged"]:
+        st["shape_logged"] = True
+        logger.info(
+            "[mc-diag] replica desc sample for key=%s own_segment=%s desc=%s",
+            keys[0][:80],
+            preferred_segment or "<none>",
+            text[:400],
+        )
+    if preferred_segment and preferred_segment in text:
+        st["own"] += 1
+    elif desc is None or not text or text in ("None", "[]", "()"):
+        st["unknown"] += 1
+    else:
+        st["other"] += 1
+
+    now = time.monotonic()
+    if now - st["last_log"] >= 30.0:
+        st["last_log"] = now
+        sampled = st["own"] + st["other"] + st["unknown"]
+        logger.info(
+            "[mc-diag] placement: puts=%d sampled=%d own=%d other=%d unknown=%d "
+            "own_segment=%s",
+            st["puts"],
+            sampled,
+            st["own"],
+            st["other"],
+            st["unknown"],
+            preferred_segment or "<none>",
+        )
+
+
 def _rotate_list(values: list[_T], offset: int) -> list[_T]:
     return values[offset:] + values[:offset]
 
@@ -670,6 +753,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
             status="partial_failure" if failed else "ok",
             num_failed_keys=len(failed),
         )
+        _diag_sample_placement(
+            self.store, keys, getattr(self.replicate_config, "preferred_segment", None)
+        )
         if failed:
             failed_codes = {res[i] for i in failed}
             logger.warning(
@@ -875,6 +961,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     num_bytes=batch_bytes,
                     status="partial_failure" if failed else "ok",
                     num_failed_keys=len(failed),
+                )
+                _diag_sample_placement(
+                    self.store,
+                    keys,
+                    getattr(self.replicate_config, "preferred_segment", None),
                 )
                 if failed:
                     failed_codes = set(res[i] for i in failed)
