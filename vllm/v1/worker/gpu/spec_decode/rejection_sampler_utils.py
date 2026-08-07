@@ -75,6 +75,9 @@ def _compute_global_residual_mass(
         # so the residual mass reduces to the closed form:
         #   p * (1 - M_b(draft_token)).
         draft_token = tl.load(draft_sampled_ptr + logit_idx + 1).to(tl.int64)
+        is_valid_draft = draft_token >= 0
+        # Avoid possible OOB ptr access: the target_logit load below is unmasked.
+        draft_token = tl.maximum(0, draft_token)
         target_lse = _compute_global_logsumexp(
             target_local_max_ptr,
             target_local_max_stride,
@@ -88,6 +91,8 @@ def _compute_global_residual_mass(
             target_logits_ptr + logit_idx * target_logits_stride + draft_token,
         ).to(tl.float32)
         m_b = tl.exp(target_logit - target_lse)
+        # A padded draft token has no point mass to subtract.
+        m_b = tl.where(is_valid_draft, m_b, 0.0)
         return prefix_joint_ratio * (1.0 - m_b)
 
 
@@ -340,6 +345,12 @@ def _compute_cumulative_log_p_kernel(
     for step in range(num_draft_tokens):
         logit_idx = start_idx + step
         draft_token = tl.load(draft_sampled_ptr + logit_idx + 1).to(tl.int64)
+        # -1 is used for padded draft token ids that should be rejected. The mask below
+        # only bounds the vocab blocks, not the token value, so an unclamped -1 reads
+        # under the logits row -- and under the whole tensor when logit_idx is 0.
+        is_valid_draft = draft_token >= 0
+        # Avoid possible OOB ptr access.
+        draft_token = tl.maximum(0, draft_token)
         target_logprob, draft_logprob, _, _ = _compute_global_logprobs_and_logsumexp(
             draft_token,
             True,  # mask
@@ -363,7 +374,11 @@ def _compute_cumulative_log_p_kernel(
             PADDED_VOCAB_NUM_BLOCKS,
             HAS_DRAFT_LOGITS,
         )
-        log_p = tl.minimum(log_p + (target_logprob - draft_logprob), 0.0)
+        # A padded draft token is always rejected, so it carries no acceptance mass.
+        log_ratio = tl.where(
+            is_valid_draft, target_logprob - draft_logprob, float("-inf")
+        )
+        log_p = tl.minimum(log_p + log_ratio, 0.0)
         tl.store(cumulative_log_p_ptr + logit_idx, log_p)
 
 
