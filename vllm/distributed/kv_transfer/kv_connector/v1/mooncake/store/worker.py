@@ -1211,6 +1211,14 @@ class MooncakeStoreWorker:
             raise RuntimeError(msg)
 
         preferred_segment = rdma_utils.get_configured_preferred_segment(extra_config)
+        # "local" is resolved to this rank's own segment name, which is only knowable
+        # once the store is up because it embeds a dynamically chosen RPC port. Unlike a
+        # fixed preferred_segment (which would funnel all ranks into one segment), this
+        # gives every rank its own, so the pool stays fully used and each rank's traffic
+        # never leaves its process.
+        local_affinity = rdma_utils.is_local_preferred_segment(preferred_segment)
+        if local_affinity:
+            preferred_segment = rdma_utils.resolve_local_preferred_segment(self.store)
         self.preferred_segment = preferred_segment
         self.store_replicate_config = ReplicateConfig()
         if preferred_segment is not None:
@@ -1218,11 +1226,12 @@ class MooncakeStoreWorker:
 
         logger.info(
             "Mooncake mode=%s (global_segment_size=%d, local_buffer_size=%d, "
-            "preferred_segment=%s, enable_offload=%s)",
+            "preferred_segment=%s%s, enable_offload=%s)",
             store_config.mode,
             store_config.global_segment_size,
             store_config.local_buffer_size,
             preferred_segment or "<none>",
+            " [local affinity]" if local_affinity and preferred_segment else "",
             store_config.enable_offload,
         )
         if store_config.mode == "embedded":
@@ -1232,7 +1241,7 @@ class MooncakeStoreWorker:
                     "preferred_segment; SSD tier will only see puts that "
                     "happen to land on the owner segment."
                 )
-            if preferred_segment is not None:
+            if preferred_segment is not None and not local_affinity:
                 logger.warning(
                     "preferred_segment=%s with mode=embedded: rank-"
                     "contributed segments will be idle.",
