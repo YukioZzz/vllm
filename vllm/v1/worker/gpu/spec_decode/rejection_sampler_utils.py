@@ -856,6 +856,12 @@ def _insert_resampled_kernel(
     num_sampled = tl.load(num_sampled_ptr + req_idx)
     start_idx = tl.load(cu_num_logits_ptr + req_idx)
     end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
+    if end_idx <= start_idx:
+        # No sampling positions, so nothing was sampled and nothing to insert. Without
+        # this, resample_token_idx == start_idx reads expanded_idx_mapping outside the
+        # request's range -- past the tensor when the empty request is last -- and the
+        # garbage it returns is then used to index temp_ptr.
+        return
     resample_token_idx = start_idx + num_sampled
     req_state_idx = tl.load(expanded_idx_mapping_ptr + resample_token_idx)
 
