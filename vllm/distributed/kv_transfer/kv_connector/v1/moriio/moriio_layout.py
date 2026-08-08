@@ -476,6 +476,125 @@ def compute_block_transfer_offsets(
     return merge_fn(offset_local, offset_remote, sizes)
 
 
+def validate_moriio_heterogeneous_dcp(
+    prefill_dcp_size: int,
+    decode_dcp_size: int,
+    is_mla: bool,
+    cp_kv_cache_interleave_size: int,
+    block_size: int,
+) -> None:
+    """Gate the P/D DCP topologies MoRIIO can actually relayout.
+
+    Named by role rather than local/remote: both sides call this, so
+    "local" would mean the prefill degree on one side and the decode degree on
+    the other.
+
+    Only ``prefill dcp=1 -> decode dcp=N`` is implemented, and only for MLA,
+    mirroring SGLang's ``requires_dcp_relayout``. Equal sizes need no relayout.
+
+    The ``cp_kv_cache_interleave_size == block_size`` requirement is what makes
+    the relayout a pure block pairing (see ``build_dcp_block_pairing``). Running
+    with a smaller interleave would make every paired block hold the wrong
+    tokens *without any error*, so this check must stay loud. It is a no-op on
+    the prefill side (with dcp=1 the interleave cannot change its layout), so
+    both engines can simply be launched with the same setting.
+    """
+    if decode_dcp_size == prefill_dcp_size:
+        return
+    if prefill_dcp_size != 1 or decode_dcp_size < 1:
+        raise NotImplementedError(
+            "MoRIIO supports only prefill dcp=1 -> decode dcp=N, got "
+            f"prefill dcp={prefill_dcp_size}, decode dcp={decode_dcp_size}"
+        )
+    if not is_mla:
+        raise NotImplementedError(
+            "MoRIIO heterogeneous DCP is implemented for MLA caches only; "
+            "non-MLA attention shards KV heads across TP as well, which the "
+            "block routing does not model"
+        )
+    if cp_kv_cache_interleave_size != block_size:
+        raise ValueError(
+            "MoRIIO heterogeneous DCP requires "
+            "cp_kv_cache_interleave_size == block_size so that each KV block "
+            "belongs to exactly one DCP rank; got "
+            f"cp_kv_cache_interleave_size={cp_kv_cache_interleave_size}, "
+            f"block_size={block_size}. Start both engines with "
+            f"--cp-kv-cache-interleave-size {block_size}."
+        )
+
+
+def build_dcp_block_pairing(
+    prefill_block_ids: list[int],
+    decode_block_ids: list[int],
+    dcp_size: int,
+    dcp_rank: int,
+    first_prefill_block_index: int = 0,
+) -> tuple[list[int], list[int]]:
+    """The blocks one decode DCP rank owns, paired with their prefill sources.
+
+    Returns ``(prefill_subset, decode_subset)``, equal length and index-aligned,
+    ready for ``compute_block_transfer_offsets`` -- each pair is still a whole
+    contiguous block, so no offset arithmetic changes.
+
+    Derivation. vLLM's slot mapping (``v1/worker/block_table.py``) puts token
+    ``pos`` on DCP rank ``((pos % (block_size*dcp)) // interleave) % dcp`` at
+    local block ``pos // (block_size*dcp)``. With ``interleave == block_size``
+    (enforced by ``validate_moriio_heterogeneous_dcp``) the *virtual* block of
+    ``block_size*dcp`` tokens splits into ``dcp`` whole blocks, one per rank, all
+    sharing one local block index. So the prefill's logical block ``j`` (tokens
+    ``[j*block_size, (j+1)*block_size)``) is owned entirely by rank ``j % dcp``
+    and lands at that rank's block slot ``j // dcp``:
+
+        this rank wants j in {dcp_rank, dcp_rank + dcp, dcp_rank + 2*dcp, ...}
+        and stores each at decode slot j // dcp
+
+    SGLang has to scatter at token granularity for the same job only because it
+    pins the interleave to 1 (``build_dcp_token_transfer_plan``).
+
+    Because the MLA latent is TP-replicated and only DCP-sharded, every prefill
+    rank holds the whole sequence, so a prefill rank still transfers to exactly
+    one decode rank -- it just sends this subset instead of every block. Groups
+    that do not participate in DCP (K3's KDA recurrent state, the DSpark draft
+    layers) are replicated across DCP ranks and need no pairing change at all.
+
+    ``first_prefill_block_index`` is the logical index of
+    ``prefill_block_ids[0]``; ownership depends on absolute position, so a
+    caller transferring a suffix must say where it starts.
+
+    A prefill block whose decode slot was never allocated is a genuine bug and
+    raises, matching ``compute_block_transfer_offsets``. Decode holding more
+    slots than prefill sends is the normal "nothing left to move" case (full
+    prefix hit, abort, spec-decode lookahead) and simply pairs fewer blocks.
+    """
+    if dcp_size < 1:
+        raise ValueError(f"dcp_size must be >= 1, got {dcp_size}")
+    if not 0 <= dcp_rank < dcp_size:
+        raise ValueError(f"dcp_rank {dcp_rank} out of range for dcp_size {dcp_size}")
+    if first_prefill_block_index < 0:
+        raise ValueError(
+            f"first_prefill_block_index must be >= 0, got {first_prefill_block_index}"
+        )
+
+    prefill_subset: list[int] = []
+    decode_subset: list[int] = []
+    for i, prefill_block in enumerate(prefill_block_ids):
+        logical = first_prefill_block_index + i
+        if logical % dcp_size != dcp_rank:
+            continue
+        decode_slot = logical // dcp_size
+        if decode_slot >= len(decode_block_ids):
+            raise ValueError(
+                "prefill blocks overrun the decode DCP allocation: logical "
+                f"block {logical} needs decode slot {decode_slot} but only "
+                f"{len(decode_block_ids)} decode blocks were allocated "
+                f"(dcp_size={dcp_size}, dcp_rank={dcp_rank})"
+            )
+        prefill_subset.append(prefill_block)
+        decode_subset.append(decode_block_ids[decode_slot])
+
+    return prefill_subset, decode_subset
+
+
 class MambaOffsetTemplate(NamedTuple):
     """Slot-independent conv+ssm offset decomposition for a KDA layer.
 

@@ -60,6 +60,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_engine import (
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_layout import (
     LayerTransferGeometry,
     apply_mamba_offset_template,
+    build_dcp_block_pairing,
     build_layer_to_spec,
     build_mamba_offset_template,
     compute_block_transfer_offsets,
@@ -68,6 +69,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_layout import (
     is_mla_cache_layer,
     iter_layer_registration_regions,
     kda_conv_ssm,
+    validate_moriio_heterogeneous_dcp,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (
     MambaConvSplitInfo,
@@ -494,6 +496,7 @@ class MoRIIOConnectorScheduler:
         )
         # Global DP rank for pinned request ownership check.
         self._global_dp_rank = self.vllm_config.parallel_config.data_parallel_rank
+        self.dcp_size = max(1, int(_pc.decode_context_parallel_size))
         self.is_producer = self.kv_transfer_config.kv_role == "kv_producer"
         # Requests that need to start recv/send.
         # New requests are added by update_state_after_alloc in
@@ -670,6 +673,9 @@ class MoRIIOConnectorScheduler:
             # like master rank 0 and hang in WAITING_FOR_REMOTE_KVS. Single-pod:
             # local == global.
             "decode_rank": self._global_dp_rank,
+            # The producer does the DCP relayout in WRITE mode, so it has to be
+            # told how many ranks the decoder shards its KV across.
+            "decode_dcp_size": self.dcp_size,
             "type": "remote_blocks",
         }
         serialized_data = msgpack.dumps(data)
@@ -807,7 +813,15 @@ class MoRIIOConnectorScheduler:
                                 blocks.get_block_ids()
                             )
                             local_attn = attn_block_ids
-                            if len(local_attn) > len(remote_attn):
+                            if self.dcp_size > 1:
+                                # DCP-sharded decode: this rank allocates one
+                                # block per dcp_size prefill blocks, so the two
+                                # lists are meant to differ in length and the
+                                # reconciliation below would mangle them. The
+                                # worker pairs them by the owner rule instead
+                                # (_dcp_pair_attention_blocks).
+                                pass
+                            elif len(local_attn) > len(remote_attn):
                                 # Speculative decode (e.g. dspark) reserves extra
                                 # lookahead blocks on the decoder, so it can allocate
                                 # more attention blocks than the prefiller holds. Only
@@ -1206,6 +1220,11 @@ class MoRIIOConnectorScheduler:
                 self.vllm_config.parallel_config.data_parallel_size_local
             ),
             tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
+            # Our own DCP degree, so the decoder can check that the producer is
+            # TP-only before relying on the 1->N relayout.
+            remote_dcp_size=(
+                self.vllm_config.parallel_config.decode_context_parallel_size
+            ),
             transfer_id=params["transfer_id"],
         )
 
@@ -1334,6 +1353,11 @@ class MoRIIOConnectorWorker:
         self._local_rank = get_world_group().local_rank
         self.tp_rank = self.moriio_config.tp_rank
         self.dp_rank = self.moriio_config.dp_rank
+        self.dcp_rank = self.moriio_config.dcp_rank
+        self.dcp_size = self.moriio_config.dcp_size
+        self.cp_kv_cache_interleave_size = (
+            self.moriio_config.cp_kv_cache_interleave_size
+        )
 
         self.local_ip = self.moriio_config.local_ip
         self.local_kv_port = self.moriio_config.local_kv_port
@@ -1660,6 +1684,7 @@ class MoRIIOConnectorWorker:
                         # consumed only by the toy proxy server.
                         "dp_size": self.moriio_config.dp_size,
                         "tp_size": self.moriio_config.tp_size,
+                        "dcp_size": self.moriio_config.dcp_size,
                         # transfer_mode is included so the router can distinguish
                         # READ (prefill-then-decode, sequential) from WRITE (concurrent)
                         # scheduling.
@@ -2219,6 +2244,7 @@ class MoRIIOConnectorWorker:
             num_blocks=self.num_blocks,
             block_len=self.block_len,
             attn_backend_name=self.backend_name,
+            dcp_size=self.dcp_size,
         )
         ready_event = threading.Event()
         self._moriio_handshake_listener_t = threading.Thread(
@@ -2944,6 +2970,59 @@ class MoRIIOConnectorWorker:
 
         return merged_local, merged_remote, merged_sizes
 
+    def _dcp_pair_attention_blocks(
+        self,
+        layer_name: str,
+        local_block_ids: list[int],
+        remote_block_ids: list[int],
+        decode_dcp_size: int,
+        prefill_dcp_size_hint: int,
+    ) -> tuple[list[int], list[int]]:
+        """Restrict an attention block pairing to one decode DCP rank's shard.
+
+        A DCP-sharded decode rank owns only every ``dcp``-th logical block, so
+        the plain ``local[i] <-> remote[i]`` pairing would move the wrong bytes.
+        Because the MLA latent is TP-replicated and only DCP-sharded, the rank
+        topology is unchanged (each prefill rank still serves exactly one decode
+        rank); only the block list shrinks.
+
+        Which rank's shard we want depends on direction: the producer writes to
+        the decode rank with its own TP index, so it targets
+        ``tp_rank % decode_dcp``; the consumer reads for itself and targets its
+        own ``dcp_rank``.
+        """
+        if self.is_producer:
+            prefill_dcp_size = self.dcp_size
+            prefill_ids, decode_ids = local_block_ids, remote_block_ids
+            dcp_rank = self.tp_rank % decode_dcp_size
+        else:
+            prefill_dcp_size = prefill_dcp_size_hint
+            prefill_ids, decode_ids = remote_block_ids, local_block_ids
+            dcp_rank = self.dcp_rank
+
+        logger.info_once(
+            "MoRIIO DCP relayout active: prefill dcp=%d -> decode dcp=%d, "
+            "this rank serves dcp_rank=%d (tp_rank=%d, interleave=%d)",
+            prefill_dcp_size,
+            decode_dcp_size,
+            dcp_rank,
+            self.tp_rank,
+            self.cp_kv_cache_interleave_size,
+        )
+        validate_moriio_heterogeneous_dcp(
+            prefill_dcp_size=prefill_dcp_size,
+            decode_dcp_size=decode_dcp_size,
+            is_mla=self._is_mla_cache_layer(layer_name),
+            cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
+            block_size=self.layer_to_spec[layer_name].block_size,
+        )
+        prefill_subset, decode_subset = build_dcp_block_pairing(
+            prefill_ids, decode_ids, decode_dcp_size, dcp_rank
+        )
+        if self.is_producer:
+            return prefill_subset, decode_subset
+        return decode_subset, prefill_subset
+
     def _compute_block_transfer_offsets(
         self,
         layer_name: str,
@@ -2951,6 +3030,7 @@ class MoRIIOConnectorWorker:
         remote_block_ids: list[int],
         remote_moriio_meta: MoRIIOAgentMetadata,
         remote_tp_size: int | None = None,
+        decode_dcp_size: int | None = None,
     ) -> tuple[list[int], list[int], list[int]]:
         """Compute transfer offsets for block data.
 
@@ -2959,9 +3039,25 @@ class MoRIIOConnectorWorker:
             local_block_ids: IDs of local blocks
             remote_block_ids: IDs of remote blocks
             remote_moriio_meta: Metadata of the remote MoRIIO agent
+            decode_dcp_size: Decode-side DCP degree. > 1 means the decoder
+                shards this cache group's tokens across ranks, so only the
+                target rank's blocks are transferred. Defaults to the local
+                degree, which is what the consumer (READ) side wants.
         Returns:
             Tuple of (local_offsets, remote_offsets, transfer_sizes)
         """
+        if decode_dcp_size is None:
+            decode_dcp_size = 1 if self.is_producer else self.dcp_size
+        if decode_dcp_size > 1:
+            local_block_ids, remote_block_ids = self._dcp_pair_attention_blocks(
+                layer_name,
+                local_block_ids,
+                remote_block_ids,
+                decode_dcp_size,
+                # On the consumer the peer *is* the prefill, so its advertised
+                # degree is what the topology gate must check.
+                prefill_dcp_size_hint=remote_moriio_meta.dcp_size,
+            )
         validate_moriio_heterogeneous_tp_kv_heads(
             local_tp_size=self.world_size,
             remote_tp_size=(

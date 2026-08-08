@@ -364,7 +364,12 @@ def test_write_transfer_plan_caches_offsets_per_geometry():
             return [list(self.kv_caches).index(layer_name)]
 
         def _compute_block_transfer_offsets(
-            self, layer_name, local_block_ids, remote_block_ids, remote_moriio_meta
+            self,
+            layer_name,
+            local_block_ids,
+            remote_block_ids,
+            remote_moriio_meta,
+            **kwargs,
         ):
             calls.append(layer_name)
             call_id = len(calls)
