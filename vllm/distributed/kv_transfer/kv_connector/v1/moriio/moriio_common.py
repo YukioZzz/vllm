@@ -121,6 +121,10 @@ class RemoteAllocInfo:
     writes_done: int = 0
     writes_expected: int | None = None
     decode_dp_rank: int = 0
+    # Decode-side decode-context-parallel degree. In WRITE mode the producer
+    # does the DCP relayout, so it needs the consumer's DCP degree; 1 means the
+    # decoder is not DCP-sharded and the transfer is the plain 1:1 pairing.
+    decode_dcp_size: int = 1
     completion_request_id: str | None = None
     completion_remote_notify_port: int | None = None
     completion_remote_ip: str | None = None
@@ -150,6 +154,10 @@ class MoRIIOAgentMetadata(
     num_blocks: int
     block_len: int
     attn_backend_name: str
+    # Decode-context-parallel degree of the advertising engine. Defaults to 1
+    # (and is omitted from the wire by omit_defaults) so a peer running an
+    # older build still decodes.
+    dcp_size: int = 1
 
 
 class RoleManager:
@@ -273,6 +281,9 @@ class MoRIIOConfig:
     dp_rank: int
     dp_size: int
     tp_size: int
+    dcp_rank: int
+    dcp_size: int
+    cp_kv_cache_interleave_size: int
     transfer_timeout: float
     defer_timeout: float
     read_mode: bool = False
@@ -320,6 +331,14 @@ class MoRIIOConfig:
         base_notify_port = int(extra_config["notify_port"])
         dp_size = vllm_config.parallel_config.data_parallel_size
         tp_size = get_tensor_model_parallel_world_size()
+        # DCP subdivides the TP group, so dcp_rank == tp_rank % dcp_size (same
+        # invariant the Mooncake store worker relies on). Read the degree from
+        # the config rather than get_dcp_group() so this stays usable before the
+        # process groups exist.
+        dcp_size = max(
+            1, int(vllm_config.parallel_config.decode_context_parallel_size)
+        )
+        dcp_rank = tp_rank % dcp_size
         port_offset = get_port_offset(dp_rank, tp_rank)
         backend = str(extra_config.get("backend", "rdma")).lower()
         if backend not in ("rdma", "xgmi"):
@@ -350,6 +369,11 @@ class MoRIIOConfig:
             dp_rank=dp_rank,
             dp_size=dp_size,
             tp_size=tp_size,
+            dcp_rank=dcp_rank,
+            dcp_size=dcp_size,
+            cp_kv_cache_interleave_size=int(
+                vllm_config.parallel_config.cp_kv_cache_interleave_size
+            ),
             read_mode=get_moriio_mode(kv_transfer_config) == MoRIIOMode.READ,
             qp_per_transfer=int(extra_config.get("qp_per_transfer", 1)),
             post_batch_size=int(extra_config.get("post_batch_size", -1)),
@@ -462,6 +486,10 @@ class ReqMeta:
     # read must target this rank's memory registration; the default 0 preserves
     # the symmetric single-DP behaviour.
     remote_dp_rank: int = 0
+    # Remote peer's decode-context-parallel degree. In READ mode the decoder
+    # uses this to assert the prefiller is TP-only (dcp=1), the only P/D DCP
+    # topology the relayout implements. 1 == homogeneous / unknown.
+    remote_dcp_size: int = 1
 
 
 class MoRIIOConnectorMetadata(KVConnectorMetadata):
@@ -527,6 +555,7 @@ class MoRIIOConnectorMetadata(KVConnectorMetadata):
             ),
             remote_dp_size=kv_transfer_params.get("remote_dp_size", 1),
             remote_dp_rank=kv_transfer_params.get("remote_dp_rank", 0),
+            remote_dcp_size=int(kv_transfer_params.get("remote_dcp_size") or 1),
         )
         if write_mode:
             self.reqs_to_save[request_id] = _req
