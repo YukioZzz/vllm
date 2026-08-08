@@ -87,6 +87,37 @@ DEFAULT_LOCAL_BUFFER_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
 MOONCAKE_NO_AVAILABLE_HANDLE = -200
 _T = TypeVar("_T")
 
+_LAYER_IDX_RE = re.compile(r"\.layers\.(\d+)\.")
+
+
+def _draft_layer_start(vllm_config: VllmConfig) -> int | None:
+    """First layer index that belongs to the speculative draft model, if there is one.
+
+    There is no marker on the layers themselves to key off. A DSpark draft is built by
+    ``load_dspark_model`` with the same naming scheme as the target -- K3DSparkModel names its
+    attention layers ``model.layers.{start_layer_id + i}.self_attn`` -- and is distinguished only
+    by ``start_layer_id``, which offsets the indices past the target's last layer. So the target's
+    own ``num_hidden_layers`` is the boundary, and anything at or above it is the draft's.
+
+    Returns None when there is no draft, or when the layer count cannot be read, so the caller
+    keeps its previous behaviour rather than excluding something it guessed at.
+    """
+    if getattr(vllm_config, "speculative_config", None) is None:
+        return None
+    target_hf = getattr(vllm_config.model_config, "hf_text_config", None) or getattr(
+        vllm_config.model_config, "hf_config", None
+    )
+    num_target_layers = getattr(target_hf, "num_hidden_layers", None)
+    if not isinstance(num_target_layers, int) or num_target_layers <= 0:
+        logger.warning(
+            "Mooncake store: speculative decoding is on but the target layer count is "
+            "unreadable (%r), so draft layers cannot be identified and will be offloaded "
+            "along with the target's.",
+            num_target_layers,
+        )
+        return None
+    return num_target_layers
+
 
 def _rotate_list(values: list[_T], offset: int) -> list[_T]:
     return values[offset:] + values[:offset]
@@ -1298,6 +1329,10 @@ class MooncakeStoreWorker:
                 )
             ]
         self._kv_cache_groups: list[KVCacheGroupSpec] = groups
+        # Layer index at which the speculative draft model's layers begin, so they can be kept
+        # out of the store. Classified from the kv_caches keys in register_kv_caches rather than
+        # from the forward context, so it cannot depend on construction order.
+        self._draft_layer_start: int | None = _draft_layer_start(vllm_config)
         spec_cfg = getattr(vllm_config, "speculative_config", None)
         use_eagle = bool(
             spec_cfg.use_eagle()
@@ -1408,6 +1443,29 @@ class MooncakeStoreWorker:
             for g_idx, db in enumerate(self.token_dbs)
         )
 
+    def _excluded_draft_layer(self, layer_name: str) -> bool:
+        """Is this layer the draft model's, and therefore not worth offloading?
+
+        A DSpark draft keeps its own MLA layers, but 1755c10c deliberately merges them into
+        the target's MLA KV-cache group so the group is not padded up and the 1M context still
+        fits. One group means one Mooncake key namespace and one address list, so every put and
+        get for a target block also covers the draft's layers.
+
+        Offloading draft KV buys nothing in the first place: the drafter recomputes the context
+        KV it needs each step (``precompute_and_store_context_kv``) and nothing reads a draft
+        page across requests. Excluding it keeps the capacity win from 1755c10c while taking the
+        draft's pages out of the store's reach.
+
+        VLLM_MOONCAKE_OFFLOAD_DRAFT_KV=1 restores the old behaviour, so the two can be A/B'd on
+        one build.
+        """
+        if self._draft_layer_start is None:
+            return False
+        if os.environ.get("VLLM_MOONCAKE_OFFLOAD_DRAFT_KV", "0") == "1":
+            return False
+        m = _LAYER_IDX_RE.search(layer_name)
+        return m is not None and int(m.group(1)) >= self._draft_layer_start
+
     def register_cross_layers_kv_caches(self, kv_cache: torch.Tensor) -> None:
         """Register a cross-layers KV cache tensor.
 
@@ -1455,6 +1513,11 @@ class MooncakeStoreWorker:
                 _layer_to_group[_ln] = _g_idx
         _storage_groups: dict[int, set[int]] = {}
         _group_segment_counts: dict[int, int] = {}
+        _group_layer_names: dict[int, list[str]] = {}
+        _skipped_draft: list[str] = []
+        # Kept so a group that turns out to be draft-only can be restored rather than left with
+        # no segments at all, which would silently make its puts and gets no-ops.
+        _skipped_by_group: dict[int, tuple[list[str], list[int], list[int]]] = {}
 
         # Addressing segments are collected PER GROUP, from each layer's own tensor.
         # Registration with the store stays per unique storage: that is about memory
@@ -1472,6 +1535,7 @@ class MooncakeStoreWorker:
             _g = _layer_to_group.get(layer_name)
             if _g is not None:
                 _storage_groups.setdefault(storage_addr, set()).add(_g)
+                _group_layer_names.setdefault(_g, []).append(layer_name)
 
             # Register each distinct buffer with the store exactly once.
             if storage_addr not in seen_ptrs:
@@ -1516,6 +1580,20 @@ class MooncakeStoreWorker:
                     new_addrs.append(layer_base + idx * seg_stride)
                     new_blens.append(seg_stride // self.num_blocks)
 
+            if _g is not None and self._excluded_draft_layer(layer_name):
+                # Keep register_buffer above: that pins a memory region, and 23 of these storages
+                # are shared with target layers anyway, so it would happen regardless. What is
+                # withheld is the addressing -- the draft's pages stop being part of any group's
+                # value, so no put or get can reach them.
+                _skipped_draft.append(layer_name)
+                s_names, s_addrs, s_blens = _skipped_by_group.setdefault(
+                    _g, ([], [], [])
+                )
+                s_names.append(layer_name)
+                s_addrs.extend(new_addrs)
+                s_blens.extend(new_blens)
+                continue
+
             addrs.extend(new_addrs)
             block_lens.extend(new_blens)
             if _g is None:
@@ -1529,6 +1607,27 @@ class MooncakeStoreWorker:
                 _group_segment_counts[_g] = _group_segment_counts.get(_g, 0) + len(
                     new_addrs
                 )
+
+        # A group made up entirely of draft layers would otherwise be left with nothing to
+        # address, which the store treats as silent no-op puts and gets. Excluding the draft is
+        # meant to stop it sharing the target's namespace, not to disable a group.
+        for _g, (s_names, s_addrs, s_blens) in _skipped_by_group.items():
+            if per_group_addrs.get(_g):
+                continue
+            logger.warning(
+                "Mooncake store: KV-cache group %d holds only draft layers (%s), so excluding "
+                "them would leave it with no segments; offloading them after all.",
+                _g,
+                s_names,
+            )
+            per_group_addrs.setdefault(_g, []).extend(s_addrs)
+            per_group_blens.setdefault(_g, []).extend(s_blens)
+            _group_segment_counts[_g] = _group_segment_counts.get(_g, 0) + len(s_addrs)
+            addrs.extend(s_addrs)
+            block_lens.extend(s_blens)
+            for _n in s_names:
+                if _n in _skipped_draft:
+                    _skipped_draft.remove(_n)
 
         logger.info(
             "Registered KV caches: num_groups=%d, num_segments=%d, num_blocks=%d",
@@ -1546,6 +1645,24 @@ class MooncakeStoreWorker:
             len(_shared),
             len(unmapped_addrs),
         )
+        if _skipped_draft:
+            logger.info(
+                "Mooncake store: excluded %d draft layers from offloading: %s "
+                "(set VLLM_MOONCAKE_OFFLOAD_DRAFT_KV=1 to include them)",
+                len(_skipped_draft),
+                _skipped_draft,
+            )
+        # Which layers ended up in which group, so a merged target+draft group is visible
+        # without having to infer it from a segment count going 24 -> 29.
+        for _g_idx in sorted(_group_layer_names):
+            _names = _group_layer_names[_g_idx]
+            logger.info(
+                "Mooncake store group %d: %d layers, first=%s last=%s",
+                _g_idx,
+                len(_names),
+                _names[0],
+                _names[-1],
+            )
 
         # Give each group only its own layers' segments. Falling back to the whole
         # list is correct only when no per-layer mapping exists at all (the
