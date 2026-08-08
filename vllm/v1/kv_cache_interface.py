@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from collections import Counter
 from dataclasses import dataclass, fields, replace
 from enum import Enum, IntEnum
@@ -434,13 +435,27 @@ class MLAAttentionSpec(FullAttentionSpec):
         compress_ratio_set = set(spec.compress_ratio for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
         block_stride_set = set(spec.indexes_kv_by_block_stride for spec in specs)
+        # VLLM_K3_MLA_MERGE_ACROSS_BACKENDS=0 restores the pre-1755c10c behaviour, where a
+        # differing indexes_kv_by_block_stride forces layers into separate KV-cache groups. On
+        # Kimi-K3 + DSpark that puts the draft's MLA layers in their own group instead of sharing
+        # the target's, at the cost of padding them up to the group size (1.65x less KV capacity,
+        # so the native 1M context no longer fits and max-model-len has to come down to match).
+        #
+        # This exists to bisect the merge itself: the merge is the only structural thing enabling
+        # DSpark changes about the store, and excluding the draft's layers from the store while
+        # leaving them in the group did not stop the fault.
+        merge_across_backends = os.environ.get(
+            "VLLM_K3_MLA_MERGE_ACROSS_BACKENDS", "1"
+        ) != "0"
         assert (
             len(cache_dtype_str_set) == 1
             and len(compress_ratio_set) == 1
             and len(model_version_set) == 1
+            and (merge_across_backends or len(block_stride_set) == 1)
         ), (
             "All attention layers in the same KV cache group must use the same "
-            "quantization method, compress ratio, and model version."
+            "quantization method, compress ratio, and model version"
+            + ("." if merge_across_backends else ", and KV block stride indexing.")
         )
         merged_spec = cls(
             block_size=specs[0].block_size,
@@ -454,7 +469,9 @@ class MLAAttentionSpec(FullAttentionSpec):
             # property of the page, so it must not force layers apart. Combine
             # conservatively: the group may only be padded if every member
             # backend can read a padded page. See the note below.
-            indexes_kv_by_block_stride=all(block_stride_set),
+            indexes_kv_by_block_stride=(
+                all(block_stride_set) if merge_across_backends else block_stride_set.pop()
+            ),
             cache_dtype_str=cache_dtype_str_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
@@ -464,7 +481,7 @@ class MLAAttentionSpec(FullAttentionSpec):
         )
         for spec in specs:
             for f in fields(AttentionSpec):
-                if f.name == "indexes_kv_by_block_stride":
+                if f.name == "indexes_kv_by_block_stride" and merge_across_backends:
                     # Combined above rather than required to match.
                     continue
                 assert getattr(spec, f.name) == getattr(merged_spec, f.name), (
