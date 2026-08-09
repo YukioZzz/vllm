@@ -20,7 +20,11 @@ moriio_layout = importlib.import_module(
 )
 
 build_dcp_block_pairing = moriio_layout.build_dcp_block_pairing
+build_dcp_token_pairing = moriio_layout.build_dcp_token_pairing
+dcp_relayout_granularity = moriio_layout.dcp_relayout_granularity
 validate_moriio_heterogeneous_dcp = moriio_layout.validate_moriio_heterogeneous_dcp
+DCP_GRANULARITY_BLOCK = moriio_layout.DCP_GRANULARITY_BLOCK
+DCP_GRANULARITY_TOKEN = moriio_layout.DCP_GRANULARITY_TOKEN
 
 
 def _owner_of_token(
@@ -176,17 +180,169 @@ def test_pairing_rejects_out_of_range_rank(bad_rank):
 
 
 # --------------------------------------------------------------------------- #
+# Token-granular pairing (interleave == 1, the regime spec decode requires)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("dcp_size", [2, 4, 8])
+@pytest.mark.parametrize("block_size", [4, 64])
+def test_token_pairing_matches_owner_rule(dcp_size, block_size):
+    """Every owned token lands where the real owner rule says it should."""
+    num_prefill_blocks = 5
+    prefill_block_ids = [100 + j for j in range(num_prefill_blocks)]
+    num_tokens = num_prefill_blocks * block_size
+    # Enough decode pages for the strided share plus slack.
+    decode_block_ids = [500 + v for v in range(num_prefill_blocks + 2)]
+
+    seen: set[int] = set()
+    for dcp_rank in range(dcp_size):
+        p_slots, d_slots = build_dcp_token_pairing(
+            prefill_block_ids, decode_block_ids, block_size, dcp_size, dcp_rank
+        )
+        assert len(p_slots) == len(d_slots)
+        positions = []
+        for ps, ds in zip(p_slots, d_slots):
+            # Recover the absolute position from the prefill slot.
+            pos = (ps // block_size - 100) * block_size + ps % block_size
+            owner, local_block, slot_in_block = _owner_of_token(
+                pos, block_size, dcp_size, interleave=1
+            )
+            assert owner == dcp_rank, f"pos {pos} is not rank {dcp_rank}'s"
+            assert ds == decode_block_ids[local_block] * block_size + slot_in_block
+            positions.append(pos)
+        # Ascending order: the destination side relies on it to coalesce.
+        assert positions == sorted(positions)
+        assert not seen & set(positions)
+        seen |= set(positions)
+
+    # Across all ranks every token is transferred exactly once.
+    assert sorted(seen) == list(range(num_tokens))
+
+
+@pytest.mark.parametrize("dcp_size", [2, 3, 4])
+def test_token_pairing_destination_is_contiguous(dcp_size):
+    """Consecutive owned tokens land in consecutive decode slots.
+
+    This is what lets merge_contiguous_offsets coalesce the destination side;
+    the source side is strided by dcp and cannot merge.
+    """
+    block_size = 8
+    prefill_block_ids = list(range(10, 10 + 6))
+    decode_block_ids = list(range(90, 90 + 6))
+    _, d_slots = build_dcp_token_pairing(
+        prefill_block_ids, decode_block_ids, block_size, dcp_size, dcp_rank=0
+    )
+    # Within a decode page the slots must step by exactly 1.
+    for a, b in zip(d_slots, d_slots[1:]):
+        same_page = a // block_size == b // block_size
+        assert (b - a == 1) if same_page else (b % block_size == 0)
+
+
+def test_token_pairing_respects_num_tokens():
+    """A partial last block must not transfer padding."""
+    block_size = 8
+    p_slots, _ = build_dcp_token_pairing(
+        [10, 11], [90, 91], block_size, dcp_size=2, dcp_rank=0, num_tokens=11
+    )
+    # rank 0 owns even positions 0,2,4,6,8,10 -> 6 tokens
+    assert len(p_slots) == 6
+    assert max(s % block_size + (s // block_size - 10) * block_size for s in p_slots) == 10
+
+
+def test_token_pairing_respects_absolute_position():
+    """A suffix transfer is owned by absolute position, not list index."""
+    block_size = 4
+    # Blocks 3,4 -> positions 12..19. With dcp=2, rank 1 owns odd positions.
+    p_slots, _ = build_dcp_token_pairing(
+        [70, 71], list(range(90, 96)), block_size, 2, 1, first_prefill_block_index=3
+    )
+    positions = [(s // block_size - 70) * block_size + s % block_size + 12 for s in p_slots]
+    assert positions == [13, 15, 17, 19]
+
+
+def test_token_pairing_overrun_raises():
+    with pytest.raises(ValueError, match="overrun the decode DCP allocation"):
+        build_dcp_token_pairing([1, 2, 3, 4], [90], 8, dcp_size=2, dcp_rank=0)
+
+
+def test_token_pairing_rejects_bad_num_tokens():
+    with pytest.raises(ValueError, match="num_tokens must fit"):
+        build_dcp_token_pairing([1], [90], 8, 2, 0, num_tokens=9)
+
+
+# --------------------------------------------------------------------------- #
+# Granularity selection
+# --------------------------------------------------------------------------- #
+
+
+def test_granularity_selection():
+    assert dcp_relayout_granularity(64, 64) == DCP_GRANULARITY_BLOCK
+    assert dcp_relayout_granularity(1, 64) == DCP_GRANULARITY_TOKEN
+    # block_size 1 is degenerate: both rules coincide, block wins.
+    assert dcp_relayout_granularity(1, 1) == DCP_GRANULARITY_BLOCK
+
+
+@pytest.mark.parametrize("interleave", [2, 16, 128])
+def test_granularity_rejects_intermediate_interleave(interleave):
+    with pytest.raises(ValueError, match="supports cp_kv_cache_interleave_size"):
+        dcp_relayout_granularity(interleave, 64)
+
+
+# --------------------------------------------------------------------------- #
 # Topology gate
 # --------------------------------------------------------------------------- #
 
 
 def test_validate_accepts_one_to_n_mla():
-    validate_moriio_heterogeneous_dcp(
-        prefill_dcp_size=1,
-        decode_dcp_size=4,
-        is_mla=True,
-        cp_kv_cache_interleave_size=64,
-        block_size=64,
+    assert (
+        validate_moriio_heterogeneous_dcp(
+            prefill_dcp_size=1,
+            decode_dcp_size=4,
+            is_mla=True,
+            cp_kv_cache_interleave_size=64,
+            block_size=64,
+        )
+        == DCP_GRANULARITY_BLOCK
+    )
+
+
+def test_validate_accepts_interleave_one_as_token_granular():
+    assert (
+        validate_moriio_heterogeneous_dcp(
+            prefill_dcp_size=1,
+            decode_dcp_size=2,
+            is_mla=True,
+            cp_kv_cache_interleave_size=1,
+            block_size=64,
+        )
+        == DCP_GRANULARITY_TOKEN
+    )
+
+
+def test_validate_spec_decode_requires_interleave_one():
+    """Whole-block copies are unavailable with spec decode, so say so early."""
+    with pytest.raises(ValueError, match="requires --cp-kv-cache-interleave-size 1"):
+        validate_moriio_heterogeneous_dcp(
+            prefill_dcp_size=1,
+            decode_dcp_size=2,
+            is_mla=True,
+            cp_kv_cache_interleave_size=64,
+            block_size=64,
+            has_spec_decode=True,
+        )
+
+
+def test_validate_spec_decode_ok_at_interleave_one():
+    assert (
+        validate_moriio_heterogeneous_dcp(
+            prefill_dcp_size=1,
+            decode_dcp_size=2,
+            is_mla=True,
+            cp_kv_cache_interleave_size=1,
+            block_size=64,
+            has_spec_decode=True,
+        )
+        == DCP_GRANULARITY_TOKEN
     )
 
 
@@ -236,9 +392,10 @@ def test_validate_rejects_non_mla():
         )
 
 
-@pytest.mark.parametrize("interleave", [1, 16, 128])
-def test_validate_rejects_non_block_aligned_interleave(interleave):
-    with pytest.raises(ValueError, match="cp_kv_cache_interleave_size == block_size"):
+@pytest.mark.parametrize("interleave", [2, 16, 128])
+def test_validate_rejects_intermediate_interleave(interleave):
+    """Neither whole-block nor per-token: no plan exists for these."""
+    with pytest.raises(ValueError, match="supports cp_kv_cache_interleave_size"):
         validate_moriio_heterogeneous_dcp(
             prefill_dcp_size=1,
             decode_dcp_size=2,

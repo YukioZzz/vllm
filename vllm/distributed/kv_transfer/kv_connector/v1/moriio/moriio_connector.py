@@ -59,11 +59,15 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_engine import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_layout import (
     LayerTransferGeometry,
+    DCP_GRANULARITY_BLOCK,
+    DCP_GRANULARITY_TOKEN,
     apply_mamba_offset_template,
     build_dcp_block_pairing,
+    build_dcp_token_pairing,
     build_layer_to_spec,
     build_mamba_offset_template,
     compute_block_transfer_offsets,
+    compute_dcp_token_transfer_offsets,
     compute_mamba_conv_split_count,
     get_layer_transfer_geometry,
     is_mla_cache_layer,
@@ -2977,14 +2981,19 @@ class MoRIIOConnectorWorker:
         remote_block_ids: list[int],
         decode_dcp_size: int,
         prefill_dcp_size_hint: int,
-    ) -> tuple[list[int], list[int]]:
-        """Restrict an attention block pairing to one decode DCP rank's shard.
+    ) -> tuple[str, list[int], list[int]]:
+        """Pair a request's blocks for one decode DCP rank's shard.
 
-        A DCP-sharded decode rank owns only every ``dcp``-th logical block, so
-        the plain ``local[i] <-> remote[i]`` pairing would move the wrong bytes.
+        A DCP-sharded decode rank owns only part of each virtual block, so the
+        plain ``local[i] <-> remote[i]`` pairing would move the wrong bytes.
         Because the MLA latent is TP-replicated and only DCP-sharded, the rank
         topology is unchanged (each prefill rank still serves exactly one decode
-        rank); only the block list shrinks.
+        rank); only the payload shrinks.
+
+        Returns ``(granularity, local, remote)``. At ``interleave == block_size``
+        the lists are block ids and a whole block is copied; at
+        ``interleave == 1`` -- which is what speculative decoding requires --
+        they are flat token slots instead.
 
         Which rank's shard we want depends on direction: the producer writes to
         the decode rank with its own TP index, so it targets
@@ -3000,28 +3009,42 @@ class MoRIIOConnectorWorker:
             prefill_ids, decode_ids = remote_block_ids, local_block_ids
             dcp_rank = self.dcp_rank
 
+        block_size = self.layer_to_spec[layer_name].block_size
+        granularity = validate_moriio_heterogeneous_dcp(
+            prefill_dcp_size=prefill_dcp_size,
+            decode_dcp_size=decode_dcp_size,
+            is_mla=self._is_mla_cache_layer(layer_name),
+            cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
+            block_size=block_size,
+            has_spec_decode=self.vllm_config.speculative_config is not None,
+        )
         logger.info_once(
             "MoRIIO DCP relayout active: prefill dcp=%d -> decode dcp=%d, "
-            "this rank serves dcp_rank=%d (tp_rank=%d, interleave=%d)",
+            "this rank serves dcp_rank=%d (tp_rank=%d, interleave=%d, "
+            "block_size=%d, granularity=%s)",
             prefill_dcp_size,
             decode_dcp_size,
             dcp_rank,
             self.tp_rank,
             self.cp_kv_cache_interleave_size,
+            block_size,
+            granularity,
         )
-        validate_moriio_heterogeneous_dcp(
-            prefill_dcp_size=prefill_dcp_size,
-            decode_dcp_size=decode_dcp_size,
-            is_mla=self._is_mla_cache_layer(layer_name),
-            cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
-            block_size=self.layer_to_spec[layer_name].block_size,
-        )
-        prefill_subset, decode_subset = build_dcp_block_pairing(
-            prefill_ids, decode_ids, decode_dcp_size, dcp_rank
-        )
+        if granularity == DCP_GRANULARITY_TOKEN:
+            prefill_sel, decode_sel = build_dcp_token_pairing(
+                prefill_ids,
+                decode_ids,
+                block_size=block_size,
+                dcp_size=decode_dcp_size,
+                dcp_rank=dcp_rank,
+            )
+        else:
+            prefill_sel, decode_sel = build_dcp_block_pairing(
+                prefill_ids, decode_ids, decode_dcp_size, dcp_rank
+            )
         if self.is_producer:
-            return prefill_subset, decode_subset
-        return decode_subset, prefill_subset
+            return granularity, prefill_sel, decode_sel
+        return granularity, decode_sel, prefill_sel
 
     def _compute_block_transfer_offsets(
         self,
@@ -3048,15 +3071,18 @@ class MoRIIOConnectorWorker:
         """
         if decode_dcp_size is None:
             decode_dcp_size = 1 if self.is_producer else self.dcp_size
+        dcp_granularity = DCP_GRANULARITY_BLOCK
         if decode_dcp_size > 1:
-            local_block_ids, remote_block_ids = self._dcp_pair_attention_blocks(
-                layer_name,
-                local_block_ids,
-                remote_block_ids,
-                decode_dcp_size,
-                # On the consumer the peer *is* the prefill, so its advertised
-                # degree is what the topology gate must check.
-                prefill_dcp_size_hint=remote_moriio_meta.dcp_size,
+            dcp_granularity, local_block_ids, remote_block_ids = (
+                self._dcp_pair_attention_blocks(
+                    layer_name,
+                    local_block_ids,
+                    remote_block_ids,
+                    decode_dcp_size,
+                    # On the consumer the peer *is* the prefill, so its advertised
+                    # degree is what the topology gate must check.
+                    prefill_dcp_size_hint=remote_moriio_meta.dcp_size,
+                )
             )
         validate_moriio_heterogeneous_tp_kv_heads(
             local_tp_size=self.world_size,
@@ -3068,6 +3094,24 @@ class MoRIIOConnectorWorker:
             total_num_kv_heads=self.model_config.get_total_num_kv_heads(),
             is_mla=self._is_mla_cache_layer(layer_name),
         )
+        def merge_fn(
+            local: list[int], remote: list[int], sizes: list[int]
+        ) -> tuple[list[int], list[int], list[int]]:
+            return self.merge_contiguous_blocks(
+                local, remote, sizes, assume_sorted=False
+            )
+
+        if dcp_granularity == DCP_GRANULARITY_TOKEN:
+            # interleave == 1: the lists are token slots, not block ids.
+            return compute_dcp_token_transfer_offsets(
+                layer_name=layer_name,
+                kv_cache=self.kv_caches[layer_name],
+                layer_to_spec=self.layer_to_spec,
+                local_slots=local_block_ids,
+                remote_slots=remote_block_ids,
+                remote_num_blocks=remote_moriio_meta.num_blocks,
+                merge_fn=merge_fn,
+            )
         return compute_block_transfer_offsets(
             layer_name=layer_name,
             kv_cache=self.kv_caches[layer_name],
@@ -3075,9 +3119,7 @@ class MoRIIOConnectorWorker:
             local_block_ids=local_block_ids,
             remote_block_ids=remote_block_ids,
             remote_num_blocks=remote_moriio_meta.num_blocks,
-            merge_fn=lambda local, remote, sizes: self.merge_contiguous_blocks(
-                local, remote, sizes, assume_sorted=False
-            ),
+            merge_fn=merge_fn,
         )
 
     def _region_session_indices(self, layer_name: str) -> list[int]:
