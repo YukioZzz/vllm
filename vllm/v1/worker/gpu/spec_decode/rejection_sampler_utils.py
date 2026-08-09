@@ -75,6 +75,9 @@ def _compute_global_residual_mass(
         # so the residual mass reduces to the closed form:
         #   p * (1 - M_b(draft_token)).
         draft_token = tl.load(draft_sampled_ptr + logit_idx + 1).to(tl.int64)
+        is_valid_draft = draft_token >= 0
+        # Avoid possible OOB ptr access: the target_logit load below is unmasked.
+        draft_token = tl.maximum(0, draft_token)
         target_lse = _compute_global_logsumexp(
             target_local_max_ptr,
             target_local_max_stride,
@@ -88,6 +91,8 @@ def _compute_global_residual_mass(
             target_logits_ptr + logit_idx * target_logits_stride + draft_token,
         ).to(tl.float32)
         m_b = tl.exp(target_logit - target_lse)
+        # A padded draft token has no point mass to subtract.
+        m_b = tl.where(is_valid_draft, m_b, 0.0)
         return prefix_joint_ratio * (1.0 - m_b)
 
 
@@ -340,6 +345,12 @@ def _compute_cumulative_log_p_kernel(
     for step in range(num_draft_tokens):
         logit_idx = start_idx + step
         draft_token = tl.load(draft_sampled_ptr + logit_idx + 1).to(tl.int64)
+        # -1 is used for padded draft token ids that should be rejected. The mask below
+        # only bounds the vocab blocks, not the token value, so an unclamped -1 reads
+        # under the logits row -- and under the whole tensor when logit_idx is 0.
+        is_valid_draft = draft_token >= 0
+        # Avoid possible OOB ptr access.
+        draft_token = tl.maximum(0, draft_token)
         target_logprob, draft_logprob, _, _ = _compute_global_logprobs_and_logsumexp(
             draft_token,
             True,  # mask
@@ -363,7 +374,11 @@ def _compute_cumulative_log_p_kernel(
             PADDED_VOCAB_NUM_BLOCKS,
             HAS_DRAFT_LOGITS,
         )
-        log_p = tl.minimum(log_p + (target_logprob - draft_logprob), 0.0)
+        # A padded draft token is always rejected, so it carries no acceptance mass.
+        log_ratio = tl.where(
+            is_valid_draft, target_logprob - draft_logprob, float("-inf")
+        )
+        log_p = tl.minimum(log_p + log_ratio, 0.0)
         tl.store(cumulative_log_p_ptr + logit_idx, log_p)
 
 
@@ -518,6 +533,15 @@ def _rejection_kernel(
     req_state_idx = tl.load(idx_mapping_ptr + req_idx).to(tl.int64)
     start_idx = tl.load(cu_num_logits_ptr + req_idx).to(tl.int64)
     end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
+    if end_idx <= start_idx:
+        # A request can reach the sampler with no positions to sample, e.g. when the
+        # cache served its whole prompt. Zero its outputs instead of falling through
+        # to row start_idx, which belongs to the next request -- or to no one at all
+        # when the empty request is the last in the batch.
+        tl.store(rejected_steps_ptr + req_idx, 0)
+        tl.store(target_rejected_logsumexp_ptr + req_idx, 0.0)
+        tl.store(draft_rejected_logsumexp_ptr + req_idx, 0.0)
+        return
     num_draft_tokens = end_idx - start_idx - 1
     seed = tl.load(seed_ptr + req_state_idx)
     temp = tl.load(temp_ptr + req_state_idx).to(tl.float32)
@@ -698,6 +722,10 @@ def _resample_kernel(
     resample_idx = tl.load(rejected_step_ptr + req_idx)
     start_idx = tl.load(cu_num_logits_ptr + req_idx).to(tl.int64)
     end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
+    if end_idx <= start_idx:
+        # No sampling positions, so nothing to resample. Without this, is_bonus is
+        # False and the loads below index one row past the request's own range.
+        return
     resample_token_idx = start_idx + resample_idx
     req_state_idx = tl.load(expanded_idx_mapping_ptr + resample_token_idx).to(tl.int64)
 
@@ -828,6 +856,12 @@ def _insert_resampled_kernel(
     num_sampled = tl.load(num_sampled_ptr + req_idx)
     start_idx = tl.load(cu_num_logits_ptr + req_idx)
     end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
+    if end_idx <= start_idx:
+        # No sampling positions, so nothing was sampled and nothing to insert. Without
+        # this, resample_token_idx == start_idx reads expanded_idx_mapping outside the
+        # request's range -- past the tensor when the empty request is last -- and the
+        # garbage it returns is then used to index temp_ptr.
+        return
     resample_token_idx = start_idx + num_sampled
     req_state_idx = tl.load(expanded_idx_mapping_ptr + resample_token_idx)
 
@@ -894,6 +928,30 @@ def rejection_sample(
     )
     num_reqs = cu_num_logits.shape[0] - 1
     num_logits, vocab_size = target_logits.shape
+
+    if num_logits == 0 or num_reqs == 0:
+        # Nothing to sample this step. Every kernel below is launched on a grid
+        # derived from num_logits or num_reqs, so going on hands Triton a zero-size
+        # grid and the GPU queue aborts:
+        #   rocdevice.cpp: HSA_STATUS_ERROR_EXCEPTION ... code: 0x1016
+        # taking the worker process with it, signalled rather than raised, so no
+        # Python frame survives to say why.
+        #
+        # Reproducible in isolation at num_reqs=1 with an empty request, for every
+        # draft_sample_method x rejection_sample_method combination; a zero-length
+        # request alongside a non-empty one is fine, it is specifically the batch
+        # having no logits at all. In service this needs speculative decoding (only
+        # then is this sampler called) together with a KV offload tier that can
+        # satisfy nearly a whole prompt, which leaves steps where every scheduled
+        # request is mid-prefill with no position to sample.
+        #
+        # No token was sampled for anyone, which num_sampled == 0 already says.
+        sampled = draft_sampled.new_zeros(
+            (num_reqs, num_speculative_steps + 1), dtype=torch.int64
+        )
+        num_sampled = draft_sampled.new_zeros((num_reqs,), dtype=torch.int32)
+        return sampled, num_sampled
+
     draft_logits_stride_0 = 0
     draft_logits_stride_1 = 0
     if has_draft_logits := draft_logits is not None:
