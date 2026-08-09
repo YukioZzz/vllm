@@ -1442,44 +1442,93 @@ class MooncakeStoreWorker:
         seen_ptrs: set[int] = set()
         addrs: list[int] = []
         block_lens: list[int] = []
+        # Which group each layer belongs to, so its segments can be given to that
+        # group's ChunkedTokenDatabase and only that one. Previously every group got
+        # the same flat all-layers list, so although each group keeps a separate
+        # Mooncake key namespace (group:{g_idx}) every put and get landed on every
+        # segment and the groups overwrote each other. Measured on Kimi-K3:
+        #   num_groups=4, num_segments=29, segments owned per group={0: 23, 3: 6}
+        # i.e. groups 1 and 2 owned nothing yet addressed all 29 segments.
+        _layer_to_group: dict[str, int] = {}
+        for _g_idx, _g in enumerate(self._kv_cache_groups):
+            for _ln in getattr(_g, "layer_names", ()) or ():
+                _layer_to_group[_ln] = _g_idx
+        _storage_groups: dict[int, set[int]] = {}
+        _group_segment_counts: dict[int, int] = {}
 
-        for value in kv_caches.values():
+        # Addressing segments are collected PER GROUP, from each layer's own tensor.
+        # Registration with the store stays per unique storage: that is about memory
+        # regions, and several layers legitimately share one buffer.
+        per_group_addrs: dict[int, list[int]] = {}
+        per_group_blens: dict[int, list[int]] = {}
+        unmapped_addrs: list[int] = []
+        unmapped_blens: list[int] = []
+
+        for layer_name, value in kv_caches.items():
             cache = _repr_tensor(value)
             cache_storage = cache.untyped_storage()
-            base_addr = cache_storage.data_ptr()
-            if base_addr in seen_ptrs:
-                continue
-            seen_ptrs.add(base_addr)
+            storage_addr = cache_storage.data_ptr()
             region_len = cache_storage.nbytes()
+            _g = _layer_to_group.get(layer_name)
+            if _g is not None:
+                _storage_groups.setdefault(storage_addr, set()).add(_g)
 
-            ret = self.store.register_buffer(base_addr, region_len)
-            if ret != 0:
-                logger.error(
-                    "register_buffer failed for addr %#x len %d: %d",
-                    base_addr,
-                    region_len,
-                    ret,
-                )
+            # Register each distinct buffer with the store exactly once.
+            if storage_addr not in seen_ptrs:
+                seen_ptrs.add(storage_addr)
+                ret = self.store.register_buffer(storage_addr, region_len)
+                if ret != 0:
+                    logger.error(
+                        "register_buffer failed for addr %#x len %d: %d",
+                        storage_addr,
+                        region_len,
+                        ret,
+                    )
+
+            # Address from THIS layer's tensor, not from the storage base. Layers of
+            # different groups share one storage here (23 of them on Kimi-K3), so
+            # keying the address list off the storage pointer both loses the per-layer
+            # slice offsets and, because of the dedup above, left whole groups with no
+            # segments of their own -- while still handing them the full list, so
+            # every group read and wrote every other group's KV bytes.
+            layer_base = cache.data_ptr()
+            el = cache.element_size()
+            layer_bytes = cache.numel() * el
+            page_size_bytes = layer_bytes // self.num_blocks
 
             # Detect layout via stride: a dim whose byte-stride exceeds
             # page_size_bytes is an outer segment dim (e.g. the K/V dim of
             # FlashAttn's (2, num_blocks, ...)). FlashInfer/MLA's blocks-
             # outermost layout has no such dim and yields a single segment.
-            el = cache.element_size()
-            page_size_bytes = region_len // self.num_blocks
             outer_dims = [
                 d for d in range(cache.ndim) if cache.stride(d) * el > page_size_bytes
             ]
+            new_addrs: list[int] = []
+            new_blens: list[int] = []
             if not outer_dims:
                 # Blocks-first layout (FlashInfer / MLA): one segment.
-                addrs.append(base_addr)
-                block_lens.append(page_size_bytes)
+                new_addrs.append(layer_base)
+                new_blens.append(page_size_bytes)
             else:
                 # K/V-first layout (FlashAttn / ROCm): split segments.
                 seg_stride = cache.stride(outer_dims[0]) * el
                 for idx in range(cache.shape[outer_dims[0]]):
-                    addrs.append(base_addr + idx * seg_stride)
-                    block_lens.append(seg_stride // self.num_blocks)
+                    new_addrs.append(layer_base + idx * seg_stride)
+                    new_blens.append(seg_stride // self.num_blocks)
+
+            addrs.extend(new_addrs)
+            block_lens.extend(new_blens)
+            if _g is None:
+                # e.g. the synthetic "__cross_layer__" entry, which is one tensor
+                # standing in for every layer and so belongs to no single group.
+                unmapped_addrs.extend(new_addrs)
+                unmapped_blens.extend(new_blens)
+            else:
+                per_group_addrs.setdefault(_g, []).extend(new_addrs)
+                per_group_blens.setdefault(_g, []).extend(new_blens)
+                _group_segment_counts[_g] = _group_segment_counts.get(_g, 0) + len(
+                    new_addrs
+                )
 
         logger.info(
             "Registered KV caches: num_groups=%d, num_segments=%d, num_blocks=%d",
@@ -1487,10 +1536,37 @@ class MooncakeStoreWorker:
             len(addrs),
             self.num_blocks,
         )
+        _shared = {p: g for p, g in _storage_groups.items() if len(g) > 1}
+        logger.info(
+            "Mooncake store addressing: segments per group=%s, layers mapped=%d/%d, "
+            "storages spanning multiple groups=%d, unmapped segments=%d",
+            dict(sorted(_group_segment_counts.items())),
+            len(_layer_to_group),
+            len(kv_caches),
+            len(_shared),
+            len(unmapped_addrs),
+        )
 
-        for db in self.token_dbs:
-            db.set_kv_caches_base_addr(addrs)
-            db.set_block_len(block_lens)
+        # Give each group only its own layers' segments. Falling back to the whole
+        # list is correct only when no per-layer mapping exists at all (the
+        # cross-layer single-tensor case); doing it per group is what caused groups
+        # to overwrite each other.
+        for g_idx, db in enumerate(self.token_dbs):
+            g_addrs = per_group_addrs.get(g_idx, [])
+            g_blens = per_group_blens.get(g_idx, [])
+            if unmapped_addrs and not g_addrs:
+                g_addrs, g_blens = unmapped_addrs, unmapped_blens
+            if not g_addrs:
+                logger.error(
+                    "KV-cache group %d has no registered segments; its Mooncake "
+                    "puts and gets will be no-ops. layer->group mapping covered "
+                    "%d/%d layers.",
+                    g_idx,
+                    len(_layer_to_group),
+                    len(kv_caches),
+                )
+            db.set_kv_caches_base_addr(g_addrs)
+            db.set_block_len(g_blens)
 
         # Start transfer threads
         if self.kv_role in ["kv_producer", "kv_both"]:
