@@ -2782,8 +2782,44 @@ class Scheduler(SchedulerInterface):
             is_affected = False
             marked_invalid_block = False
             req_id = request.request_id
-            # TODO (davidb): add support for hybrid memory allocator
-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
+            # Hybrid models (e.g. Kimi-K3: MLA attention + KDA recurrent state)
+            # return one block-id list per KV-cache group, so the single-group
+            # unpack this used to do raised ValueError from update_from_output on
+            # the EngineCore thread -- turning a KV load failure the scheduler
+            # can recover from by recomputing the affected prefix into a dead
+            # engine. Block ids come from one shared pool and are therefore
+            # unique across groups, so the only group that can matter here is
+            # the one that actually holds an invalid block.
+            req_block_id_groups = self.kv_cache_manager.get_block_ids(req_id)
+            if len(req_block_id_groups) == 1:
+                (req_block_ids,) = req_block_id_groups
+            else:
+                # More than one group can hold invalid blocks for the same request, so taking the
+                # first group that intersects is not enough. Block ids come from one shared pool, so
+                # a request routinely ends up with a stray invalid block in a KDA group and its
+                # entire MLA group invalid at the same time. Measured on Kimi-K3:
+                #
+                #   groups=(idx,nblocks,ninvalid)=[(0,103,1), (1,103,1), (2,103,1), (3,96,96)]
+                #
+                # Picking group 0 there truncated at its one stray block, near the end of the list,
+                # so num_computed_tokens moved by a single block and the request went on to verify
+                # against 95 blocks of KV that had never been written. Group 3, invalid from index 0,
+                # was never examined. Over one run that was 22 requests with invalid blocks against
+                # 3 truncations, 2 of which moved by one block.
+                #
+                # Take the group whose earliest invalid block is earliest overall, so the rollback
+                # lands at the earliest corrupted position. With this, the same run truncates at
+                # index 0 (num_computed_tokens -> 0, i.e. recompute the prefix) and the decode-side
+                # HSA_STATUS_ERROR_EXCEPTION that this corruption used to cause disappears.
+                best_invalid_idx: int | None = None
+                req_block_ids = []
+                for group in req_block_id_groups:
+                    for idx_in_group, block_id in enumerate(group):
+                        if block_id in invalid_block_ids:
+                            if best_invalid_idx is None or idx_in_group < best_invalid_idx:
+                                best_invalid_idx = idx_in_group
+                                req_block_ids = group
+                            break
             # We iterate only over blocks that may contain externally computed
             # tokens
             req_num_computed_tokens = (
