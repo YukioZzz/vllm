@@ -490,6 +490,11 @@ class ReqMeta:
     # uses this to assert the prefiller is TP-only (dcp=1), the only P/D DCP
     # topology the relayout implements. 1 == homogeneous / unknown.
     remote_dcp_size: int = 1
+    # Prompt length in tokens. Only the token-granular DCP relayout needs it: its
+    # unit is one token slot rather than a whole block, so without a live length
+    # it has to assume every slot of every block holds real KV and ships the
+    # partial last block in full. 0 == unknown (falls back to that assumption).
+    num_prompt_tokens: int = 0
 
 
 class MoRIIOConnectorMetadata(KVConnectorMetadata):
@@ -513,6 +518,7 @@ class MoRIIOConnectorMetadata(KVConnectorMetadata):
         local_block_ids: list[int],
         kv_transfer_params: dict[str, Any],
         write_mode=False,
+        num_prompt_tokens: int = 0,
     ):
         transfer_id = kv_transfer_params["transfer_id"]
 
@@ -556,6 +562,7 @@ class MoRIIOConnectorMetadata(KVConnectorMetadata):
             remote_dp_size=kv_transfer_params.get("remote_dp_size", 1),
             remote_dp_rank=kv_transfer_params.get("remote_dp_rank", 0),
             remote_dcp_size=int(kv_transfer_params.get("remote_dcp_size") or 1),
+            num_prompt_tokens=int(num_prompt_tokens or 0),
         )
         if write_mode:
             self.reqs_to_save[request_id] = _req
