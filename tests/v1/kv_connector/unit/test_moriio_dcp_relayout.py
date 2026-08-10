@@ -270,6 +270,34 @@ def test_token_pairing_rejects_bad_num_tokens():
         build_dcp_token_pairing([1], [90], 8, 2, 0, num_tokens=9)
 
 
+@pytest.mark.parametrize("dcp_size", [2, 4])
+def test_token_pairing_live_length_moves_no_padding(dcp_size):
+    """The whole point of threading the prompt length through the connector.
+
+    A prompt that ends mid-block leaves the rest of that block uninitialized.
+    Without a live length the plan covers the block's full capacity and ships
+    that tail; with it, the ranks together move exactly the live tokens.
+    """
+    block_size = 128
+    num_tokens = 1733  # 14 blocks of 128 = 1792 capacity, so 59 slots are padding
+    n_pblocks = -(-num_tokens // block_size)
+    prefill = [1000 + i for i in range(n_pblocks)]
+    decode = [7000 + i for i in range(-(-num_tokens // (block_size * dcp_size)) + 2)]
+
+    live = sum(
+        len(build_dcp_token_pairing(
+            prefill, decode, block_size, dcp_size, r, num_tokens=num_tokens)[0])
+        for r in range(dcp_size)
+    )
+    full = sum(
+        len(build_dcp_token_pairing(prefill, decode, block_size, dcp_size, r)[0])
+        for r in range(dcp_size)
+    )
+    assert live == num_tokens
+    assert full == n_pblocks * block_size
+    assert full > live  # i.e. the default really does ship the padding
+
+
 # --------------------------------------------------------------------------- #
 # Granularity selection
 # --------------------------------------------------------------------------- #
