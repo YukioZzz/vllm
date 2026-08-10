@@ -1637,6 +1637,27 @@ class MoRIIOConnectorWorker:
                     len(self._draft_only_layers),
                     sorted(self._draft_only_layers),
                 )
+            # The other direction is not benign. Layers the PREFILL registered but
+            # this decoder does not have mean the two sides built different KV cache
+            # configurations -- in practice a speculative_config set on one side and
+            # not the other, which also changes the recurrent-state geometry of every
+            # KDA layer. Nothing downstream notices: the pull succeeds and the model
+            # generates fluent text about something else entirely (measured on
+            # gsm8k: 1/40, with completions coming back as CSS rules and git diffs).
+            # Fail at the handshake instead.
+            remote_only = sorted(
+                set(remote_layer_map) - set(self.layer_name_to_local_kv_cache_metadata)
+            )
+            if remote_only:
+                raise MoRIIOError(
+                    f"KV cache layout mismatch with {remote_engine_id}: the remote "
+                    f"registered {len(remote_only)} layer(s) this engine does not "
+                    f"have ({remote_only[:8]}{'...' if len(remote_only) > 8 else ''}). "
+                    "Prefill and decode must run the same model and the same "
+                    "speculative_config; a draft model on one side only changes both "
+                    "the layer set and the KDA recurrent-state geometry, and the "
+                    "transferred state would be read into the wrong layers."
+                )
         if remote_engine_id not in self.built_write_session:
             cur_remote_engine_sessions = []
             for ln, local_metas in self.layer_name_to_local_kv_cache_metadata.items():
