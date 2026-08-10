@@ -1059,6 +1059,10 @@ class MoRIIOConnectorScheduler:
                 request_id=req_id,
                 local_block_ids=block_ids,
                 kv_transfer_params=kv_params,
+                # READ recomputes the last prompt token locally, so only N-1
+                # tokens actually come off the wire (see
+                # get_num_new_matched_tokens).
+                num_prompt_tokens=max(req.num_prompt_tokens - 1, 0),
             )
 
         for req_id, (req, block_ids) in self._reqs_need_save.items():
@@ -2875,6 +2879,7 @@ class MoRIIOConnectorWorker:
             remote_dp_rank=meta.remote_dp_rank,
             chosen_tp=chosen_tp,
             flexible=flexible,
+            num_prompt_tokens=meta.num_prompt_tokens,
         )
 
     def _write_blocks_for_req(self, req_id: ReqId, meta: ReqMeta, layer_name, kv_layer):
@@ -2981,6 +2986,7 @@ class MoRIIOConnectorWorker:
         remote_block_ids: list[int],
         decode_dcp_size: int,
         prefill_dcp_size_hint: int,
+        num_prompt_tokens: int = 0,
     ) -> tuple[str, list[int], list[int]]:
         """Pair a request's blocks for one decode DCP rank's shard.
 
@@ -3031,12 +3037,19 @@ class MoRIIOConnectorWorker:
             granularity,
         )
         if granularity == DCP_GRANULARITY_TOKEN:
+            # A prompt that ends mid-block leaves the tail of the last block
+            # uninitialized; without a live length we would ship it. Clamp
+            # because a prefix-cache hit can trim the block list we were given.
+            live_tokens = min(
+                num_prompt_tokens or 0, len(prefill_ids) * block_size
+            ) or None
             prefill_sel, decode_sel = build_dcp_token_pairing(
                 prefill_ids,
                 decode_ids,
                 block_size=block_size,
                 dcp_size=decode_dcp_size,
                 dcp_rank=dcp_rank,
+                num_tokens=live_tokens,
             )
         else:
             prefill_sel, decode_sel = build_dcp_block_pairing(
@@ -3054,6 +3067,7 @@ class MoRIIOConnectorWorker:
         remote_moriio_meta: MoRIIOAgentMetadata,
         remote_tp_size: int | None = None,
         decode_dcp_size: int | None = None,
+        num_prompt_tokens: int = 0,
     ) -> tuple[list[int], list[int], list[int]]:
         """Compute transfer offsets for block data.
 
@@ -3066,6 +3080,10 @@ class MoRIIOConnectorWorker:
                 shards this cache group's tokens across ranks, so only the
                 target rank's blocks are transferred. Defaults to the local
                 degree, which is what the consumer (READ) side wants.
+            num_prompt_tokens: Live prompt length, used only by the
+                token-granular DCP relayout to stop at the last real token
+                instead of at the end of the last (usually partial) block.
+                0 == unknown.
         Returns:
             Tuple of (local_offsets, remote_offsets, transfer_sizes)
         """
@@ -3082,6 +3100,7 @@ class MoRIIOConnectorWorker:
                     # On the consumer the peer *is* the prefill, so its advertised
                     # degree is what the topology gate must check.
                     prefill_dcp_size_hint=remote_moriio_meta.dcp_size,
+                    num_prompt_tokens=num_prompt_tokens,
                 )
             )
         validate_moriio_heterogeneous_tp_kv_heads(
@@ -3295,6 +3314,7 @@ class MoRIIOConnectorWorker:
         remote_dp_rank: int = 0,
         chosen_tp: int | None = None,
         flexible: bool = False,
+        num_prompt_tokens: int = 0,
     ) -> None:
         if self.mode == MoRIIOMode.WRITE:
             return
@@ -3394,6 +3414,7 @@ class MoRIIOConnectorWorker:
                     remote_attn,
                     remote_moriio_meta,
                     remote_tp_size=remote_tp_size,
+                    num_prompt_tokens=num_prompt_tokens,
                 )
                 statuses.append(
                     self._post_read_with_backoff(
