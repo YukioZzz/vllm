@@ -20,6 +20,7 @@ from vllm.model_executor.layers.attention.mla_attention import (
     QueryLenSupport,
 )
 from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
     AttentionLayer,
@@ -580,7 +581,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             ]
         )
         use_gluon_decode = AiterMLAHelper.use_gluon_decode(
-            self.num_heads, int(max_qo_len)
+            self.num_heads, int(max_qo_len), self.dcp_world_size
         )
 
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
@@ -826,11 +827,21 @@ class AiterMLAHelper:
         )
 
     @staticmethod
-    def use_gluon_decode(num_heads: int, max_qo_len: int) -> bool:
+    def use_gluon_decode(
+        num_heads: int, max_qo_len: int, dcp_world_size: int = 1
+    ) -> bool:
+        if dcp_world_size > 1:
+            # DCP needs a per-rank softmax LSE, which only gluon returns. gluon
+            # tiles query heads, so the head-count limit does not apply.
+            return max_qo_len == 1
         return num_heads < AiterMLAHelper._AITER_MIN_MLA_HEADS and max_qo_len == 1
 
 
 class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
+    # gluon MLA decode returns the merged softmax LSE for DCP cross-rank merge.
+    can_return_lse_for_decode: bool = True
+    lse_base_on_e: bool = True
+
     def __init__(
         self,
         num_heads: int,
@@ -860,6 +871,12 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
             **mla_args,
         )
         AiterMLAHelper.check_num_heads_validity(num_heads)
+
+        # The gluon path keeps queries in bf16, so it cannot take fp8 queries.
+        if (
+            num_heads < AiterMLAHelper._AITER_MIN_MLA_HEADS or self.dcp_world_size > 1
+        ) and is_quantized_kv_cache(self.kv_cache_dtype):
+            self.supports_quant_query_input = False
 
         unsupported_features = [alibi_slopes, sliding_window, logits_soft_cap]
         if any(unsupported_features):
@@ -1073,6 +1090,12 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         assert decode.max_qo_len is not None
         assert decode.paged_kv_indptr is not None
         assert decode.paged_kv_indices is not None
+        if self.dcp_world_size > 1 and not decode.use_gluon_decode:
+            raise NotImplementedError(
+                "ROCM_AITER_MLA with decode context parallelism currently supports "
+                "only the gluon decode path (q_len == 1); this batch has "
+                f"max_qo_len={int(decode.max_qo_len)}."
+            )
         if decode.use_gluon_decode:
             if type(q) is tuple:
                 q_nope, q_pe = q
@@ -1090,7 +1113,8 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
             )
             kv_buffer = kv_c_and_k_pe_cache.reshape(-1, kv_c_and_k_pe_cache.shape[-1])
             mla_gluon = _get_mla_gluon()
-            mla_gluon(
+            need_lse = self.dcp_world_size > 1
+            gluon_ret = mla_gluon(
                 q_nope=q_nope,
                 q_pe=q_pe,
                 kv_c=kv_buffer,
@@ -1103,8 +1127,16 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
                 use_2d_view=False,
                 kv_scale=1.0,
                 min_kv_seq_len=decode.min_kv_seq_len,
+                return_lse=need_lse,
             )
-            return o, None
+            lse = gluon_ret[1] if isinstance(gluon_ret, tuple) else None
+            if need_lse:
+                assert lse is not None, (
+                    "aiter mla_gluon(return_lse=True) returned no LSE; upgrade aiter "
+                    "to a build with gluon LSE support."
+                )
+                lse = lse.reshape(B, num_q_heads)
+            return o, lse
 
         # 12-head (<16) multi-token verify (DSpark): the asm path has no
         # gqa<16, qseqlen>1 kernel. Flatten each verify token to its own

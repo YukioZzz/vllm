@@ -400,6 +400,15 @@ class MLAAttentionSpec(FullAttentionSpec):
         super().__post_init__()
         _apply_alignment_padding(self)
 
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        # Replicated draft groups store the full sequence on every rank.
+        if self.non_causal_multi_token_decode:
+            return (
+                cdiv(vllm_config.model_config.max_model_len, self.block_size)
+                * self.page_size_bytes
+            )
+        return super().max_memory_usage_bytes(vllm_config)
+
     @property
     def storage_block_size(self) -> int:
         return self.block_size // self.compress_ratio

@@ -305,10 +305,17 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
 
         vllm_config = get_current_vllm_config()
         parallel_config = vllm_config.parallel_config
-        assert (
-            parallel_config.decode_context_parallel_size <= 1
-            and parallel_config.prefill_context_parallel_size <= 1
-        ), "Kimi-K3 MultiHeadLatentAttention does not support context parallelism."
+        assert parallel_config.prefill_context_parallel_size <= 1, (
+            "Kimi-K3 MultiHeadLatentAttention does not support prefill context "
+            "parallelism."
+        )
+        if parallel_config.decode_context_parallel_size > 1:
+            assert self.non_causal_multi_token_decode, (
+                "Kimi-K3 MultiHeadLatentAttention under DCP is only supported for "
+                "the DSpark draft, whose KV cache group is replicated."
+            )
+            self.impl.dcp_world_size = 1  # type: ignore[attr-defined]
+            self.impl.dcp_rank = 0  # type: ignore[attr-defined]
         self.prefill_backend = get_mla_prefill_backend(vllm_config)(
             num_heads=self.num_local_heads,
             scale=self.scale,
