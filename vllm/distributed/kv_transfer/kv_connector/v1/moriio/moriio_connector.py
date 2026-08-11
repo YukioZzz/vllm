@@ -2035,9 +2035,31 @@ class MoRIIOConnectorWorker:
                 self.block_size,
             )
             self.block_size = first_geometry.block_size
-        # TODO(tms): self.block_len needs to be per-layer for sliding window,
-        # hybrid attn, etc
-        # block size in bytes
+        # Block length in bytes, taken from the first attention layer.
+        #
+        # Attention layers do NOT have to agree on this, and requiring them to used to
+        # abort startup on Kimi-K3: it is hybrid, so vLLM allocates several KV-cache
+        # groups and the group holding the KDA layers gets its own, larger page. At
+        # k=3 that is 3072 tokens against the MLA groups' 1536, and registration died
+        # with "MoRIIO KV cache block size mismatch for layer
+        # model.layers.93.self_attn: 1536 != 3072" on all eight ranks.
+        #
+        # Nothing in the transfer path needs a single uniform value:
+        #   - registration sizes each region from its OWN layer geometry
+        #     (moriio_layout.iter_layer_registration_regions -> region_len)
+        #   - transfer sizes and strides are recomputed per layer, per request
+        #     (moriio_layout.compute_block_transfer_offsets -> transfer_size_byte,
+        #      block_stride), from the local tensor plus the peer's num_blocks
+        #   - the peer never reads this scalar: MoRIIOAgentMetadata.block_len is
+        #     written here and consumed nowhere; the only cross-engine quantity used
+        #     is num_blocks
+        # So per-layer lengths are recorded in self.block_lens below and this scalar
+        # is kept only for the one derivation that genuinely wants a single page size:
+        # compute_physical_blocks_per_logical(). Taking the first layer's value there
+        # matches NIXL, whose own signature documents the argument as "the engine's
+        # block_len in bytes (from block_lens[0])" -- KDA state is addressed per
+        # logical KV block, and the logical block is the attention page the scheduler
+        # allocates, not the KDA group's physical page.
         self.block_len = first_geometry.block_len
         self.kv_cache_shape = first_kv_cache.shape
         self.block_shape = block_shape
@@ -2059,16 +2081,26 @@ class MoRIIOConnectorWorker:
                     kv_caches_base_addr.append(base_addr)
                 continue
             geometry = self._get_layer_transfer_geometry(layer_name)
-            if geometry.block_size != self.block_size:
-                raise ValueError(
-                    "MoRIIO KV cache block size mismatch for layer "
-                    f"{layer_name}: {geometry.block_size} != {self.block_size}"
-                )
             self.block_lens[layer_name] = geometry.block_len
             for cache, region_len in self._iter_layer_registration_regions(layer_name):
                 base_addr = cache.data_ptr()
                 caches_data.append((base_addr, region_len, cache.device.index, ""))
                 kv_caches_base_addr.append(base_addr)
+
+        # Say it out loud when the groups disagree. This is expected on a hybrid model
+        # and used to be fatal, so a run that silently had one page size and a run that
+        # has three should not look identical in the log.
+        distinct_block_lens = sorted(set(self.block_lens.values()))
+        if len(distinct_block_lens) > 1:
+            logger.info(
+                "MoRIIO registered %d attention layers with %d distinct block "
+                "lengths (bytes): %s; transfer sizes and strides are per layer, "
+                "and %d is the page used for the KDA logical-block ratio.",
+                len(self.block_lens),
+                len(distinct_block_lens),
+                distinct_block_lens,
+                self.block_len,
+            )
 
         for layer_name, kv_cache in kv_caches.items():
             if layer_name not in self.layer_name_to_local_kv_cache_metadata:
