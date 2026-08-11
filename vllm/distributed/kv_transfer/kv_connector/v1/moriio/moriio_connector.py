@@ -440,6 +440,44 @@ class MoRIIOConnectorScheduler:
         )
         self._has_mamba = bool(self._mamba_group_ids)
 
+        # SSM slot bookkeeping, mirroring NixlConnectorScheduler. Two facts about a mamba group's slot
+        # list are NOT true of an attention group's block list, and MoRIIO used to transfer the list
+        # verbatim as if they were:
+        #
+        #   1. The mamba manager co-allocates TRAILING SCRATCH SLOTS per request for speculative
+        #      decoding. They hold no state a peer can use; shipping them overwrites the remote's slots
+        #      with scratch. This applies in every mamba_cache_mode.
+        #   2. Only mamba_cache_mode == "all" keeps a state per block POSITION. Every other mode -- and
+        #      `align`, which the LMCache path requires, is one of them -- keeps a single running state
+        #      in the last non-speculative slot, so only that one slot is meaningful.
+        #
+        # Getting this wrong is invisible on a fresh sequence, where the running state happens to sit in
+        # the slot a positional reader would pick anyway, and shows up once prefix reuse changes the slot
+        # list's composition: fluent output, wrong answers, degrading with cache warmth.
+        self._ssm_spec_blocks: dict[int, int] = {}
+        if kv_cache_config is not None:
+            for gi in self._mamba_group_ids:
+                spec = kv_cache_config.kv_cache_groups[gi].kv_cache_spec
+                self._ssm_spec_blocks[gi] = int(
+                    getattr(spec, "num_speculative_blocks", 0) or 0
+                )
+        self._ssm_state_slots_are_positional = (
+            vllm_config.cache_config.mamba_cache_mode == "all"
+        )
+        # Escape hatch for A/B against the previous behaviour without a rebuild.
+        self._clip_ssm_slots_enabled = (
+            os.environ.get("VLLM_MORIIO_CLIP_SSM_SLOTS", "1") != "0"
+        )
+        if self._has_mamba:
+            logger.info(
+                "MoRIIO SSM slots: mamba_cache_mode=%s positional=%s "
+                "spec_blocks_per_group=%s clipping=%s",
+                vllm_config.cache_config.mamba_cache_mode,
+                self._ssm_state_slots_are_positional,
+                self._ssm_spec_blocks,
+                "on" if self._clip_ssm_slots_enabled else "OFF",
+            )
+
         assert vllm_config.kv_transfer_config is not None, (
             "kv_transfer_config must be set for MoRIIOConnector"
         )
@@ -1074,10 +1112,27 @@ class MoRIIOConnectorScheduler:
         mamba: list[int] = []
         for gi, group in enumerate(block_ids):
             if gi in self._mamba_group_ids:
-                mamba.extend(group)
+                mamba.extend(self._clip_ssm_slots(gi, group))
             else:
                 attn.extend(group)
         return attn, mamba
+
+    def _clip_ssm_slots(self, group_idx: int, blocks: "list[int]") -> list[int]:
+        """Reduce a mamba group's slot list to the slots that actually carry transferable state.
+
+        Mirrors NixlConnectorScheduler: drop the trailing speculative scratch slots, then -- unless the
+        cache mode keeps a state per block position -- keep only the last one, which is where the single
+        running state lives. See the note in __init__ for why transferring the raw list is wrong.
+        """
+        out = list(blocks)
+        if not self._clip_ssm_slots_enabled or not out:
+            return out
+        # Never clip to empty: downstream reads an empty list as a full prefix hit.
+        if n_spec := min(self._ssm_spec_blocks.get(group_idx, 0), len(out) - 1):
+            out = out[:-n_spec]
+        if not self._ssm_state_slots_are_positional:
+            out = out[-1:]
+        return out
 
     def request_finished(
         self,
