@@ -29,6 +29,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     MoRIIOError,
     MoRIIOTransferAck,
     RemoteAllocInfo,
+    TransferBatchState,
     TransferError,
     TransferId,
     WriteTask,
@@ -58,6 +59,14 @@ try:
     logger.info("MoRIIO is available")
 except ImportError:
     logger.error("MoRIIO is not available")
+
+try:
+    from mori.io import StatusCode
+except ImportError:
+    # Builds older than ROCm/mori#341 expose neither StatusCode nor
+    # IOEngine.WaitAll. sglang's MI35x CI broke on exactly that, so the Python
+    # polling path has to stay reachable.
+    StatusCode = None
 
 
 """Write task execution logic for MoRIIO connector."""
@@ -616,6 +625,7 @@ class MoRIIOWrapper:
         self.notify_thread: threading.Thread | None = None
         self.sessions: list[IOEngine.Session] = []
         self.paths: dict[str, zmq.Socket] = {}
+        self._wait_all_supported: bool | None = None
 
     def set_moriio_engine(self, moriio_engine):
         assert moriio_engine is not None, (
@@ -733,6 +743,46 @@ class MoRIIOWrapper:
         )
         return transfer_status
 
+    def _batch_wait_available(self) -> bool:
+        """True if this mori build exposes the batched wait (ROCm/mori#341).
+
+        Probed once and cached. An image pinning an older mori raises
+        AttributeError on the first transfer instead -- which is how this same
+        API broke sglang's MI35x CI -- so the polling path stays reachable.
+        """
+        if self._wait_all_supported is None:
+            self._wait_all_supported = StatusCode is not None and hasattr(
+                self.moriio_engine, "wait_all"
+            )
+            logger.info(
+                "MoRIIO batched transfer wait (wait_all) available: %s",
+                self._wait_all_supported,
+            )
+        return self._wait_all_supported
+
+    def poll_transfer_batch(self, transfer_statuses: list[Any]) -> TransferBatchState:
+        """Non-blocking verdict over every status of one request.
+
+        Checking only the newest status calls a request done while an earlier
+        layer's read is unfinished or already failed -- and
+        _post_read_with_backoff deliberately hands back a failed status when the
+        send queue never drains, so failures do land on layers other than the
+        last.
+
+        Kept as a Python scan on purpose even where wait_all exists: mori's
+        zero-timeout wait runs PollProgress on the calling thread, which would
+        drive the backend's progress callback from the engine thread alongside
+        its own CQ poller. The semantics here are identical and it introduces no
+        new concurrency, which matters while we are chasing a race.
+        """
+        state = TransferBatchState.DONE
+        for status in transfer_statuses:
+            if status.Failed():
+                return TransferBatchState.FAILED
+            if not status.Succeeded():
+                state = TransferBatchState.PENDING
+        return state
+
     def waiting_for_transfer_complete(self, transfer_statuses: list[Any] | None = None):
         if transfer_statuses is None:
             with self.lock:
@@ -744,6 +794,58 @@ class MoRIIOWrapper:
         if not transfers_to_wait:
             return
 
+        if self._batch_wait_available():
+            self._wait_all_transfers(transfers_to_wait)
+        else:
+            self._poll_transfers_until_done(transfers_to_wait)
+
+    def _wait_all_transfers(self, transfers_to_wait: list[Any]) -> None:
+        """Block on the whole batch inside mori, with the GIL released.
+
+        This is the blocking path only, where the benefit is concrete and the
+        risk is not: the READ barrier waits here on the forward thread, so the
+        Python fallback would spin at 1 ms holding the GIL for the full transfer
+        and starve the very threads it waits on. mori blocks on a condition
+        variable instead, shares one deadline across the batch, and gives
+        failure precedence over still-in-flight.
+        """
+        timeout = self._transfer_timeout
+        # timeout_ms == 0 means "poll once" to mori, so never round down to it.
+        timeout_ms = max(int(timeout * 1000), 1)
+        rc = self.moriio_engine.wait_all(transfers_to_wait, timeout_ms=timeout_ms)
+        if rc == StatusCode.SUCCESS:
+            return
+        raise TransferError(self._describe_transfer_failure(transfers_to_wait, rc))
+
+    def _describe_transfer_failure(self, transfers_to_wait: list[Any], rc) -> str:
+        """Recover the per-status detail a batch return code loses.
+
+        Runs only on the failure path, so it costs nothing in steady state.
+        """
+        timeout = self._transfer_timeout
+        errors: list[str] = []
+        for status in transfers_to_wait:
+            if status.Succeeded():
+                continue
+            if status.Failed():
+                errors.append(
+                    f"RDMA transfer failed: {status.Message()} (code={status.Code()})"
+                )
+            else:
+                errors.append(
+                    f"RDMA transfer timed out after {timeout:.0f}s. "
+                    f"Check NIC queue depth or reduce concurrency; "
+                    f"adjust with kv_connector_extra_config.transfer_timeout."
+                )
+        if not errors:
+            errors.append(f"batch wait returned {rc} with every status terminal")
+        return (
+            f"{len(errors)}/{len(transfers_to_wait)} transfers failed "
+            f"(batch wait rc={rc}):\n" + "\n".join(errors)
+        )
+
+    def _poll_transfers_until_done(self, transfers_to_wait: list[Any]) -> None:
+        """Fallback for mori builds without the batched wait."""
         timeout = self._transfer_timeout
         deadline = time.monotonic() + timeout
         remaining = list(transfers_to_wait)
