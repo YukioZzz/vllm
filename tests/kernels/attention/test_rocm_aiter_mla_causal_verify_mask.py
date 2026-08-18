@@ -110,6 +110,13 @@ def _run_verify_block():
     vllm_config.speculative_config = SpeculativeConfig(
         method="ngram", num_speculative_tokens=QLEN - 1
     )
+    # get_num_attention_heads() reads model_arch_config, which is derived when
+    # ModelConfig is built, so the hf_config override alone would leave the
+    # builder sizing the decode for the checkpoint's 128 heads while the impl
+    # below runs with NUM_QUERY_HEADS.
+    vllm_config.model_config.model_arch_config.total_num_attention_heads = (
+        NUM_QUERY_HEADS
+    )
 
     spec = MLAAttentionSpec(
         block_size=PAGE_SIZE,
@@ -148,7 +155,15 @@ def _run_verify_block():
         captured["seq_info"] = kwargs["seq_info"].detach().clone()
         captured["min_kv_seq_len"] = kwargs["min_kv_seq_len"]
 
-    with set_current_vllm_config(vllm_config):
+    # The arch probe is forced for the builder as well as for the forward below:
+    # the builder takes the per-row KV ranges, so it has to reach the same
+    # routing decision the impl acts on.
+    gluon_arch_probe = patch(
+        "vllm.v1.attention.backends.mla.rocm_aiter_mla._gluon_mla_decode_supported",
+        lambda: True,
+    )
+
+    with set_current_vllm_config(vllm_config), gluon_arch_probe:
         builder = builder_cls(spec, [layer_name], vllm_config, device)
         common_attn_metadata = create_common_attn_metadata(
             batch_spec, PAGE_SIZE, device, arange_block_indices=True
