@@ -504,12 +504,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             spec = kv_cache_group.kv_cache_spec
             block_sizes.append(spec.block_size)
-            # When using DCP, each request's KV cache is sharded among different ranks.
-            # As a result, one block on the current rank covers `block_size * cp_size`
-            # tokens in the full, global (unsharded) sequence.
-            max_num_blocks = cdiv(
-                block_table_max_model_len, spec.block_size * self.dcp_size
-            )
+            # Slot mapping accounts for DCP sharding; block-table rows still
+            # cover the full global sequence.
+            max_num_blocks = cdiv(block_table_max_model_len, spec.block_size)
             # For Mamba/Hybrid Model, KVCaches need extra blocks for speculative tokens
             if isinstance(spec, MambaSpec):
                 max_num_blocks = (
