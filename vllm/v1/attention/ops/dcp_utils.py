@@ -25,7 +25,25 @@ logger = init_logger(__name__)
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
 
+    from vllm.config.parallel import ParallelConfig
     from vllm.distributed.parallel_state import GroupCoordinator
+
+
+def resolve_dcp_q_replicate(parallel_config: ParallelConfig) -> bool:
+    """Whether MLA decode should replicate the Q projection under DCP.
+
+    ``VLLM_DCP_Q_REPLICATE`` unset → auto-on when ``dcp_comm_backend=="a2a"``;
+    ``0``/``1`` forces off/on. Still requires ``dcp>1`` and no PCP.
+    """
+    flag = envs.VLLM_DCP_Q_REPLICATE
+    if flag is None:
+        flag = parallel_config.dcp_comm_backend == "a2a"
+    return (
+        bool(flag)
+        and parallel_config.decode_context_parallel_size > 1
+        and parallel_config.prefill_context_parallel_size <= 1
+    )
+
 
 try:
     import torch.distributed._symmetric_memory as symm_mem
@@ -72,6 +90,9 @@ def _direct_dcp_enabled(
 ) -> bool:
     if use_direct is not None:
         return use_direct
+    # Direct DCP custom ops are CUDA-only; refuse auto-enable on ROCm.
+    if current_platform.is_rocm():
+        return False
     return (
         symm_mem_available
         and current_platform.is_cuda()
