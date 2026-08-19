@@ -200,6 +200,8 @@ if TYPE_CHECKING:
     VLLM_USE_DIRECT_DCP_A2A: bool | None = None
     VLLM_USE_DIRECT_DCP_Q_GATHER: bool | None = None
     VLLM_USE_DIRECT_DCP_KV_GATHER: bool | None = None
+    # Keep FULL cudagraph when DCP>1 (default platform forces PIECEWISE).
+    VLLM_ALLOW_DCP_FULL_CUDAGRAPH: bool = False
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
         "full",
@@ -2115,6 +2117,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_USE_DIRECT_DCP_KV_GATHER": lambda: maybe_convert_bool(
         os.getenv("VLLM_USE_DIRECT_DCP_KV_GATHER")
+    ),
+    # Keep FULL cudagraph when DCP>1 (default platform forces PIECEWISE).
+    "VLLM_ALLOW_DCP_FULL_CUDAGRAPH": lambda: bool(
+        int(os.getenv("VLLM_ALLOW_DCP_FULL_CUDAGRAPH", "0"))
     ),
     # Whether to enable dual cuda streams for LoRA computation
     # (used by both BaseLinearLayerWithLoRA and FusedMoEWithLoRA to
