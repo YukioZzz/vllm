@@ -22,6 +22,7 @@ def _reduce_mla_segment_partials_kernel(
     TILE_SIZE: tl.constexpr,
     KV_LORA_RANK: tl.constexpr,
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,
+    LOGE2: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
@@ -127,5 +128,6 @@ def reduce_mla_segment_partials(
         TILE_SIZE=tile_size,
         KV_LORA_RANK=kv_lora_rank,
         NUM_SEGMENTS_PER_SEQ=num_segments,
+        LOGE2=LOGE2,
     )
     return output, lse
