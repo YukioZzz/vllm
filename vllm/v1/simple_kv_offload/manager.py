@@ -579,9 +579,17 @@ class SimpleCPUOffloadScheduler:
             block_hashes_to_store: list[bytes] = []
             advanced_per_group: list[int] = [0] * num_groups
             out_of_space = False
-            # Confirmed tokens: KV data written and visible to all streams.
+            # Confirmed tokens: include tokens already computed in prior steps
+            # and tokens scheduled in the current step. Current-step stores are
+            # ordered after a compute-done event in the worker, so their KV is
+            # visible before DMA reads begin.
             req = state.request
-            confirmed_tokens = req.num_computed_tokens - req.num_output_placeholders
+            confirmed_tokens = (
+                req.num_computed_tokens
+                + num_new_tokens
+                - req.num_output_placeholders
+            )
+            confirmed_tokens = max(0, min(confirmed_tokens, req.num_tokens))
             # Cap to blocks with confirmed KV data.
             aligned_tokens = confirmed_tokens // self.block_size * self.block_size
 

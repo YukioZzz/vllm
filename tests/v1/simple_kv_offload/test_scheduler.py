@@ -412,6 +412,48 @@ def test_eager_store_and_load_roundtrip() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Test 1a-2: Eager store on current-step scheduled tokens
+# ---------------------------------------------------------------------------
+def test_eager_store_uses_current_step_scheduled_tokens() -> None:
+    """A request whose tokens are scheduled in this step (but not yet reflected
+    in ``request.num_computed_tokens``) should still be store-eligible.
+
+    This mirrors the real engine flow where connector metadata is built before
+    ``request.num_computed_tokens`` is advanced.
+    """
+    fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=16, lazy=False)
+    sched = fix.scheduler
+
+    num_blocks = 2
+    req = make_request(num_blocks=num_blocks)
+
+    # `confirmed=False`: request.num_computed_tokens remains 0.
+    kv_blocks = _alloc_and_register(fix, req, num_blocks, confirmed=False)
+    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
+    sched_out = make_scheduler_output(
+        {req.request_id: num_blocks * BLOCK_SIZE},
+        new_reqs={req.request_id: kv_blocks.get_block_ids()},
+    )
+
+    meta = sched.build_connector_meta(sched_out)
+    assert meta.store_event >= 0
+    assert len(meta.store_gpu_blocks) > 0
+    simulate_store_completion(sched, meta.store_event)
+
+    req2 = Request(
+        request_id="req-eager-current-step-load",
+        prompt_token_ids=req.prompt_token_ids,
+        sampling_params=req.sampling_params,
+        pooling_params=None,
+        mm_features=None,
+        block_hasher=req._block_hasher,
+    )
+    hit_tokens, is_async = sched.get_num_new_matched_tokens(req2, num_computed_tokens=0)
+    assert hit_tokens == num_blocks * BLOCK_SIZE
+    assert is_async is True
+
+
+# ---------------------------------------------------------------------------
 # Test 1b: Boundary — max_hit_len cap drops the last full block when the
 # prompt is an exact multiple of BLOCK_SIZE.
 # ---------------------------------------------------------------------------
