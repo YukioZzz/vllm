@@ -443,6 +443,52 @@ def test_store_sending_thread_records_mooncake_metrics():
     assert stats.data["save_put"][0]["status"] == "ok"
 
 
+def test_store_sending_thread_splits_large_put_into_bounded_waves(monkeypatch):
+    store = MagicMock()
+    store.batch_is_exist.return_value = [0, 0]
+    store.batch_put_from_multi_buffers.side_effect = [[256], [256]]
+    thread = _make_store_sending_thread(store)
+    monkeypatch.setattr(worker, "_MOONCAKE_SAVE_BATCH_BYTES", 300)
+
+    thread.add_stored_request("req-a")
+    thread._handle_request(_make_store_req("req-a", [b"a0", b"a1"]))
+
+    assert store.batch_put_from_multi_buffers.call_count == 2
+    put_keys = [
+        call.args[0] for call in store.batch_put_from_multi_buffers.call_args_list
+    ]
+    assert put_keys == [
+        ["test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6130"],
+        ["test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6131"],
+    ]
+
+
+def test_store_sending_thread_emits_events_for_successful_waves_on_retry(
+    monkeypatch,
+):
+    store = MagicMock()
+    store.batch_is_exist.side_effect = [[0, 0], [1, 0]]
+    store.batch_put_from_multi_buffers.side_effect = [[256], [-200], [256]]
+    thread = _make_store_sending_thread(store)
+    thread.enable_kv_event = True
+    monkeypatch.setattr(worker, "_MOONCAKE_SAVE_BATCH_BYTES", 300)
+
+    thread.add_stored_request("req-a")
+    thread._handle_request(_make_store_req("req-a", [b"a0", b"a1"]))
+    first_event = thread.get_kv_events()[0]
+
+    assert first_event.block_hashes == [maybe_convert_block_hash(BlockHash(b"a0"))]
+    assert first_event.parent_block_hash is None
+
+    thread._clear_store_pressure()
+    thread.add_stored_request("req-a")
+    thread._handle_request(_make_store_req("req-a", [b"a0", b"a1"]))
+    second_event = thread.get_kv_events()[0]
+
+    assert second_event.block_hashes == [maybe_convert_block_hash(BlockHash(b"a1"))]
+    assert second_event.parent_block_hash == maybe_convert_block_hash(BlockHash(b"a0"))
+
+
 def test_process_tokens_uses_mask_num_as_start_chunk():
     db = ChunkedTokenDatabase(
         KeyMetadata("test-model", 0, 0, 0, 0),
@@ -636,10 +682,15 @@ def _make_partial_tail_send_thread(
     enable_group_semantics=False,
     supports_group_ids=False,
 ):
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+    spec = FullAttentionSpec(block_size=4, num_kv_heads=8, head_size=64, dtype=None)
     coord = SimpleNamespace(
         enable_partial_hash_hits=True,
         hash_block_size=4,
         lcm_block_size=16,
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)],
+        eagle_group_ids=set(),
     )
     db = ChunkedTokenDatabase(
         KeyMetadata("test-model", 0, 0, 0, 0),
@@ -750,6 +801,24 @@ def test_store_sending_thread_skips_null_sparse_group_blocks():
     assert all(addr[0] >= 0x2000 for key, addr in zip(keys, addrs) if "@group:1" in key)
 
 
+def test_partial_tail_offload_allows_single_key_larger_than_batch_target(
+    monkeypatch,
+):
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.side_effect = [[256], [256], [256]]
+    thread = _make_partial_tail_send_thread(store)
+    monkeypatch.setattr(worker, "_MOONCAKE_SAVE_BATCH_BYTES", 128)
+
+    assert thread._maybe_offload_partial_tail(_make_partial_tail_req([1, 2, 3]))
+
+    assert store.batch_put_from_multi_buffers.call_count == 3
+    assert all(
+        len(call.args[0]) == 1
+        for call in store.batch_put_from_multi_buffers.call_args_list
+    )
+
+
 def test_partial_tail_offload_replaces_stale_group_ids_after_filtering():
     store = MagicMock()
     store.batch_is_exist.return_value = [1, 0, 0]
@@ -774,6 +843,53 @@ def test_partial_tail_offload_replaces_stale_group_ids_after_filtering():
         "vllm-mooncake-store:test-model@6131",
         "vllm-mooncake-store:test-model@6132",
     ]
+
+
+def test_eagle_partial_tail_marker_does_not_alias_complete_block_data():
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.return_value = [256, 1]
+    spec = FullAttentionSpec(block_size=16, num_kv_heads=8, head_size=64, dtype=None)
+    coord = SimpleNamespace(
+        enable_partial_hash_hits=True,
+        hash_block_size=4,
+        lcm_block_size=16,
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)],
+        eagle_group_ids={0},
+    )
+    db = ChunkedTokenDatabase(
+        KeyMetadata("test-model", 0, 0, 0, 0),
+        block_size=16,
+        hash_block_size=4,
+    )
+    db.set_kv_caches_base_addr([0x1000])
+    db.set_block_len([256])
+    thread = _make_store_sending_thread(
+        store,
+        coord=coord,
+        token_databases=[db],
+        block_size=16,
+    )
+    req = ReqMeta(
+        req_id="req-a",
+        token_len_chunk=0,
+        block_ids=([1, 2],),
+        block_hashes=[b"a0", b"a1", b"a2", b"a3", b"a4"],
+        can_save=True,
+        partial_tail_offloads=[(0, 2, 20)],
+    )
+
+    assert thread._maybe_offload_partial_tail(req)
+
+    keys, addrs, sizes, _config = store.batch_put_from_multi_buffers.call_args.args
+    assert keys == [
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6133",
+        "test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@6134",
+    ]
+    assert addrs == [[0x1000 + 256], [0x1000 + 2 * 256]]
+    assert sizes == [[256], [1]]
 
 
 def test_partial_tail_offload_honors_active_pressure_gate():

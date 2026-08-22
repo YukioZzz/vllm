@@ -75,7 +75,9 @@ class MooncakeStoreScheduler:
             kv_cache_config, vllm_config
         )
         self.enable_partial_hash_hits = partial_hash_hits_enabled(
-            kv_cache_config.kv_cache_groups, self._hash_block_size
+            kv_cache_config.kv_cache_groups,
+            self._hash_block_size,
+            vllm_config.parallel_config.decode_context_parallel_size,
         )
 
         # Per-request state

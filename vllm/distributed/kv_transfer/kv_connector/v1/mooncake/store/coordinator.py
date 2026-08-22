@@ -67,6 +67,7 @@ class MooncakeStoreCoordinator:
         hash_block_size: int,
         use_eagle: bool = False,
         retention_interval: int | None = None,
+        dcp_world_size: int = 1,
     ) -> None:
         assert all(
             g.kv_cache_spec.block_size % hash_block_size == 0 for g in kv_cache_groups
@@ -83,7 +84,7 @@ class MooncakeStoreCoordinator:
         self.hash_block_size = hash_block_size
         self.lcm_block_size = scheduler_block_size
         self.enable_partial_hash_hits = partial_hash_hits_enabled(
-            kv_cache_groups, hash_block_size
+            kv_cache_groups, hash_block_size, dcp_world_size
         )
         self.use_eagle = use_eagle
         # Mirror vLLM core's KVCacheCoordinator.retention_interval.
@@ -398,15 +399,27 @@ def _unwrap_spec(spec: KVCacheSpec) -> KVCacheSpec:
 
 
 def partial_hash_hits_enabled(
-    kv_cache_groups: list[KVCacheGroupSpec], hash_block_size: int
+    kv_cache_groups: list[KVCacheGroupSpec],
+    hash_block_size: int,
+    dcp_world_size: int = 1,
 ) -> bool:
-    """Mirror of core's ``HybridKVCacheCoordinator.enable_partial_hash_hits``
-    (its dcp == 1 clause holds: the connector rejects hybrid + DCP/PCP > 1).
-    Single copy on purpose — scheduler and coordinator must not disagree.
-    """
+    """Mirror of core's ``HybridKVCacheCoordinator.enable_partial_hash_hits``."""
     return any(
-        isinstance(spec := _unwrap_spec(g.kv_cache_spec), MambaSpec)
-        and spec.mamba_cache_mode == "align"
-        and spec.block_size > hash_block_size
+        (
+            isinstance(spec := _unwrap_spec(g.kv_cache_spec), MambaSpec)
+            and spec.mamba_cache_mode == "align"
+            and (
+                spec.block_size > hash_block_size
+                or (
+                    dcp_world_size > 1
+                    and spec.block_size == hash_block_size
+                )
+            )
+        )
+        or (
+            dcp_world_size > 1
+            and isinstance(spec, FullAttentionSpec)
+            and spec.block_size * dcp_world_size > hash_block_size
+        )
         for g in kv_cache_groups
     )
