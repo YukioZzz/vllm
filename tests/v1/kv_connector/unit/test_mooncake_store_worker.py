@@ -730,11 +730,12 @@ def test_partial_tail_waits_for_durable_mamba_source():
         MambaSpec,
     )
 
+    def put_sizes(keys, addrs, sizes, config):
+        return [sum(size) for size in sizes]
+
     store = MagicMock()
     store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
-    store.batch_put_from_multi_buffers.side_effect = (
-        lambda keys, addrs, sizes, config: [sum(size) for size in sizes]
-    )
+    store.batch_put_from_multi_buffers.side_effect = put_sizes
 
     full = FullAttentionSpec(block_size=16, num_kv_heads=8, head_size=64, dtype=None)
     mamba = MambaSpec(
