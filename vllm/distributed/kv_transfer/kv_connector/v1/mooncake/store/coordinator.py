@@ -116,12 +116,27 @@ class MooncakeStoreCoordinator:
                 if group.spec == spec:
                     assert manager_cls is group.manager_cls
                     group.group_ids.append(i)
-                    if g.is_eagle_group and not group.use_eagle:
-                        attention_groups[idx] = group._replace(use_eagle=True)
+                    use_eagle = group.use_eagle or g.is_eagle_group
+                    veto_exempt = (
+                        group.veto_exempt
+                        and g.is_eagle_group
+                        and g.eagle_group_is_veto_exempt
+                    )
+                    if use_eagle != group.use_eagle or veto_exempt != group.veto_exempt:
+                        attention_groups[idx] = group._replace(
+                            use_eagle=use_eagle,
+                            veto_exempt=veto_exempt,
+                        )
                     break
             else:
                 attention_groups.append(
-                    SpecGroup(spec, [i], manager_cls, g.is_eagle_group)
+                    SpecGroup(
+                        spec,
+                        [i],
+                        manager_cls,
+                        g.is_eagle_group,
+                        g.is_eagle_group and g.eagle_group_is_veto_exempt,
+                    )
                 )
         # Full attention first (matches upstream convergence ordering).
         attention_groups.sort(key=lambda g: not isinstance(g.spec, FullAttentionSpec))
@@ -296,7 +311,9 @@ class MooncakeStoreCoordinator:
             else self.lcm_block_size
         )
         if len(self.attention_groups) == 1:
-            spec, group_ids, manager_cls, group_eagle = self.attention_groups[0]
+            spec, group_ids, manager_cls, group_eagle, _veto_exempt = (
+                self.attention_groups[0]
+            )
             hit_blocks, hit_length = manager_cls.find_longest_cache_hit(
                 block_hashes=block_hashes,  # type: ignore[arg-type]
                 max_length=max_length,
@@ -325,9 +342,19 @@ class MooncakeStoreCoordinator:
         while True:
             curr_hit_length = hit_length
 
-            for idx, (spec, group_ids, manager_cls, group_eagle) in enumerate(
-                self.attention_groups
-            ):
+            for idx, (
+                spec,
+                group_ids,
+                manager_cls,
+                group_eagle,
+                veto_exempt,
+            ) in enumerate(self.attention_groups):
+                if veto_exempt:
+                    # Mirrors HybridKVCacheCoordinator.find_longest_cache_hit:
+                    # ephemeral draft state neither constrains the converged
+                    # boundary nor reuses external blocks, so skip the lookup
+                    # instead of discarding its result.
+                    continue
                 first_group_id = group_ids[0]
                 cached = hit_blocks_by_group[first_group_id]
                 if isinstance(spec, FullAttentionSpec) and cached is not None:
@@ -383,10 +410,11 @@ class MooncakeStoreCoordinator:
         if isinstance(first_group.spec, FullAttentionSpec):
             num_blocks = cdiv(hit_length, first_group.spec.block_size)
             for group_id in first_group.group_ids:
-                full_blks = hit_blocks_by_group[group_id]
-                assert full_blks is not None
-                del full_blks[num_blocks:]
-                hit_length_by_group[group_id] = hit_length
+                # A veto-exempt lead group is skipped above and so never
+                # records blocks; it has nothing to truncate.
+                if (full_blks := hit_blocks_by_group[group_id]) is not None:
+                    del full_blks[num_blocks:]
+                    hit_length_by_group[group_id] = hit_length
 
         return (
             tuple(blks if blks is not None else [] for blks in hit_blocks_by_group),

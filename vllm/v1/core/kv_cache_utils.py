@@ -1780,6 +1780,7 @@ def _annotate_eagle_groups(
     for group in kv_cache_groups:
         if getattr(group.kv_cache_spec, "non_causal_multi_token_decode", False):
             group.is_eagle_group = True
+            group.eagle_group_is_veto_exempt = spec_config.has_ephemeral_draft_context()
 
     if not use_deepseek_v4_fallback:
         return

@@ -4413,13 +4413,16 @@ def test_swa_shared_prefix_reuse_under_zero_retention():
     assert last_req_hit(retention=0, pin=True) == 4 * block_size
 
 
-def test_eagle_group_veto_exempt_does_not_poison_other_groups():
+@pytest.mark.parametrize("draft_cached_blocks", [0, 2])
+def test_eagle_group_veto_exempt_does_not_poison_other_groups(
+    draft_cached_blocks: int,
+):
     """A veto-exempt eagle group (KVCacheGroupSpec.eagle_group_is_veto_exempt,
     e.g. DSpark's draft-context group per
-    SpeculativeConfig.has_ephemeral_draft_context()) whose lookup finds zero
-    matching blocks must not zero out another group's independently
-    confirmed hit. Regular eagle groups (EAGLE/EAGLE3/MTP/DFlash without the
-    veto-exempt flag) already zero the whole request on a miss, unchanged,
+    SpeculativeConfig.has_ephemeral_draft_context()) must not shrink another
+    group's independently confirmed hit, whether the draft lookup is a total
+    miss or a shorter nonzero hit. Regular eagle groups
+    (EAGLE/EAGLE3/MTP/DFlash without the veto-exempt flag) remain authoritative
     and are covered by test_prefill_hybrid_model_eagle and friends."""
     block_size = 16
     kv_cache_config = KVCacheConfig(
@@ -4468,22 +4471,23 @@ def test_eagle_group_veto_exempt_does_not_poison_other_groups():
     manager.free(req0)
 
     # New request with the same tokens: normally both groups would hit.
-    # Simulate the veto-exempt group's data being unavailable (e.g. DSpark's
-    # sparse, request-specific draft KV) by evicting all of ITS cached block
-    # hashes only, leaving the full-attention group's cache untouched.
+    # Simulate the veto-exempt group being unavailable or having only a shorter
+    # prefix (e.g. DSpark's sparse, request-specific draft KV), while leaving
+    # the full-attention group's cache untouched.
     req1 = make_request("1", token_ids, block_size, hash_fn)
     group1_hashes = [make_block_hash_with_group_id(h, 1) for h in block_hashes]
     cache = manager.block_pool.cached_block_hash_to_block._cache
-    backup = {h: cache.pop(h) for h in group1_hashes if h in cache}
+    evicted_hashes = group1_hashes[draft_cached_blocks:]
+    backup = {h: cache.pop(h) for h in evicted_hashes if h in cache}
     try:
         computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req1)
     finally:
         for h, v in backup.items():
             cache[h] = v
 
-    # Without the fix, the veto-exempt group's total miss would zero the
-    # whole request (num_computed_tokens == 0) despite the full-attention
-    # group having real, independently-confirmed data available. The
+    # Without the fix, the veto-exempt group's zero/shorter hit would shrink
+    # the whole request despite the full-attention group having real,
+    # independently-confirmed data available. The
     # presence of a sliding-window group reserves 1 token for logprobs
     # (max_cache_hit_length = 63), so the full-attention group's hit aligns
     # down to 3 blocks (48 tokens), not the full 4: that reservation is

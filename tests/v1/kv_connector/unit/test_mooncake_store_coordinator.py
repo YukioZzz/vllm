@@ -3,6 +3,7 @@
 
 from math import lcm
 
+import pytest
 import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator import (  # noqa: E501
@@ -735,3 +736,48 @@ def test_dsv4_five_group_eagle_store_lookup_round_trip():
     # The final 256-token segment has no lookahead block, so EAGLE falls back
     # to the previous aligned boundary instead of consuming all 768 tokens.
     assert hit == 512
+
+
+@pytest.mark.parametrize("draft_cached_blocks", [0, 2])
+def test_veto_exempt_draft_does_not_shrink_target_external_hit(
+    draft_cached_blocks: int,
+):
+    """A veto-exempt DSpark draft group must not shrink an independently
+    confirmed target hit on the Mooncake external lookup path."""
+    groups = [
+        KVCacheGroupSpec(["target"], _full(16)),
+        KVCacheGroupSpec(
+            ["draft"],
+            _swa(block_size=16, sliding_window=32),
+            is_eagle_group=True,
+            eagle_group_is_veto_exempt=True,
+        ),
+    ]
+    coord = _make_coord(groups, hash_block_size=16, use_eagle=True)
+    hs = _hashes(4)
+    exists = {(0, bytes(h)) for h in hs}
+    exists.update((1, bytes(h)) for h in hs[:draft_cached_blocks])
+    _masks, hit = coord.find_longest_cache_hit(
+        hs, max_length=64, cached_block_pool=ExternalCachedBlockPool(16, exists)
+    )
+    assert hit == 64
+
+
+def test_non_veto_exempt_eagle_miss_still_zeros_external_hit():
+    """Regular eagle groups remain authoritative on the Mooncake path."""
+    groups = [
+        KVCacheGroupSpec(["target"], _full(16)),
+        KVCacheGroupSpec(
+            ["draft"],
+            _swa(block_size=16, sliding_window=32),
+            is_eagle_group=True,
+            eagle_group_is_veto_exempt=False,
+        ),
+    ]
+    coord = _make_coord(groups, hash_block_size=16, use_eagle=True)
+    hs = _hashes(4)
+    exists = {(0, bytes(h)) for h in hs}
+    _masks, hit = coord.find_longest_cache_hit(
+        hs, max_length=64, cached_block_pool=ExternalCachedBlockPool(16, exists)
+    )
+    assert hit == 0

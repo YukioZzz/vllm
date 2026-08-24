@@ -3244,19 +3244,20 @@ def _spec_decode_grouping_config(method="dspark"):
         speculative_config=SimpleNamespace(
             method=method,
             use_eagle=lambda: True,
+            has_ephemeral_draft_context=lambda: method == "dspark",
         ),
     )
 
 
-def _hybrid_specs_with_draft(draft: bool, draft_shares_target_spec: bool = False):
+def _hybrid_specs_with_draft(draft: bool, draft_matches_target_dtype: bool = False):
     """A K3-shaped hybrid: MLA full attention + Mamba, optionally plus a
     DSpark-style draft MLA layer marked non_causal_multi_token_decode.
 
-    The target's fp8 KV dtype is what keeps the draft in its own bucket, as it
-    does on Kimi-K3 (target `--kv-cache-dtype fp8_e4m3`, draft `auto`). Pass
-    draft_shares_target_spec to collapse them into one group instead.
+    On Kimi-K3 the target's fp8 KV dtype (target `--kv-cache-dtype fp8_e4m3`,
+    draft `auto`) already separates the two. Pass draft_matches_target_dtype to
+    remove that difference, leaving the marker as the only thing between them.
     """
-    target_dtype = None if draft_shares_target_spec else "fp8_e4m3"
+    target_dtype = None if draft_matches_target_dtype else "fp8_e4m3"
     specs = {
         "target.attn.0": new_mla_spec(block_size=64, cache_dtype_str=target_dtype),
         "target.attn.1": new_mla_spec(block_size=64, cache_dtype_str=target_dtype),
@@ -3279,23 +3280,29 @@ def test_draft_group_annotated_on_hybrid_general_path():
     flagged = [g for g in groups if g.is_eagle_group]
     assert len(flagged) == 1
     assert flagged[0].layer_names == ["draft.attn.0"]
+    assert flagged[0].eagle_group_is_veto_exempt
 
 
-def test_mamba_groups_never_flagged_even_when_draft_shares_a_group():
-    # MLAAttentionSpec.merge ORs non_causal_multi_token_decode rather than
-    # requiring equality, so a draft layer can share a group with target
-    # layers; that combined group still holds volatile draft KV and must be
-    # flagged. What must never happen is a Mamba group being flagged: that
-    # widens its lookup window to two consecutive chunks, which align-mode
-    # checkpointing never produces, zeroing every lookup.
+def test_marker_alone_keeps_the_draft_in_its_own_group():
+    # MLAAttentionSpec.merge requires every layer in a group to agree on
+    # non_causal_multi_token_decode, and _get_kv_cache_groups_uniform_page_size
+    # treats that AssertionError as "incompatible specs". So the marked draft
+    # layer lands in a group of its own even when every other spec field
+    # matches the target, and the marker is still there to be found after
+    # grouping -- the annotation does not depend on the KV dtype differing.
+    #
+    # What must never happen is a Mamba group being flagged: that widens its
+    # lookup window to two consecutive chunks, which align-mode checkpointing
+    # never produces, zeroing every lookup.
     groups = get_kv_cache_groups(
         _spec_decode_grouping_config(),
-        _hybrid_specs_with_draft(draft=True, draft_shares_target_spec=True),
+        _hybrid_specs_with_draft(draft=True, draft_matches_target_dtype=True),
     )
 
+    flagged = [g for g in groups if g.is_eagle_group]
+    assert len(flagged) == 1
+    assert flagged[0].layer_names == ["draft.attn.0"]
     for group in groups:
-        if "draft.attn.0" in group.layer_names:
-            assert group.is_eagle_group
         if isinstance(group.kv_cache_spec, MambaSpec):
             assert not group.is_eagle_group
 

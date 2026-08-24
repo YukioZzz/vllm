@@ -837,12 +837,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         bounded below by 0.
 
         A veto-exempt eagle group (SpecGroup.veto_exempt, see
-        KVCacheGroupSpec.eagle_group_is_veto_exempt) whose lookup finds
-        exactly zero matching blocks for the current candidate length is
-        left unconfirmed for this round instead of shrinking
-        ``curr_hit_length`` to 0: such a group's stored content has no
-        request-independent reuse value, so a miss from it does not mean
-        the other, independently-confirmed groups' data is unavailable.
+        KVCacheGroupSpec.eagle_group_is_veto_exempt) does not constrain
+        ``curr_hit_length``. Such a group's stored content has no
+        request-independent reuse value and is recomputed from target-model
+        state, so either a miss or a shorter EAGLE-pruned hit must not shrink
+        the independently-confirmed target groups' reusable prefix.
 
         Args:
             block_hashes: The block hashes of the request.
@@ -883,6 +882,14 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 use_eagle,
                 veto_exempt,
             ) in enumerate(self.attention_groups):
+                if veto_exempt:
+                    # Ephemeral draft state is never authoritative for target
+                    # prefix reuse: it is rebuilt from target hidden states, so
+                    # neither its hit nor its miss may move the converged
+                    # boundary. Skipping the lookup outright keeps that
+                    # one-way relationship local -- the group also never
+                    # records blocks, so it reuses nothing and is recomputed.
+                    continue
                 first_group_id = group_ids[0]
                 # DCP/PCP shard each block's KV across ranks, so the manager's
                 # effective block size may exceed the spec's.
@@ -931,10 +938,6 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         first_group_id
                     ].pcp_world_size,
                 )
-                if veto_exempt and _new_hit_length == 0:
-                    # Not authoritative: leave unconfirmed for this round
-                    # rather than vetoing every other group's confirmed hit.
-                    continue
                 if drop_eagle_block:
                     eagle_verified.add(idx)
                 elif _new_hit_length < curr_hit_length:
