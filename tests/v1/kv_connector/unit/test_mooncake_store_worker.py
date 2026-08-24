@@ -3383,6 +3383,72 @@ def test_config_defaults_to_embedded():
     assert cfg.tenant_id == worker.DEFAULT_TENANT_ID
 
 
+@pytest.mark.parametrize(
+    ("tp_rank", "expected"),
+    [(0, "rdma0"), (3, "rdma3"), (7, "rdma7"), (8, "rdma0")],
+)
+def test_select_rank_local_rdma_device(tp_rank, expected):
+    devices = [f"rdma{rank}" for rank in range(8)]
+    assert worker._select_rank_local_rdma_device("rdma0", tp_rank, devices) == expected
+
+
+def test_select_rank_local_rdma_device_falls_back_when_none_exist():
+    assert worker._select_rank_local_rdma_device("rdma0", 3, []) == "rdma0"
+
+
+def test_configure_rank_local_rdma_bind_address(monkeypatch):
+    monkeypatch.delenv("MC_RDMA_BIND_ADDRESS", raising=False)
+    monkeypatch.setattr(worker.os, "listdir", lambda _path: ["tw-eth3"])
+    monkeypatch.setattr(
+        worker.psutil,
+        "net_if_addrs",
+        lambda: {
+            "tw-eth3": [
+                SimpleNamespace(
+                    family=worker.socket.AF_INET,
+                    address="10.101.5.131",
+                )
+            ]
+        },
+    )
+
+    assert worker._configure_rank_local_rdma_bind_address("rdma3") == "10.101.5.131"
+    assert worker.os.environ["MC_RDMA_BIND_ADDRESS"] == "10.101.5.131"
+
+
+def test_configure_rank_local_rdma_bind_address_preserves_override(monkeypatch):
+    monkeypatch.setenv("MC_RDMA_BIND_ADDRESS", "10.9.8.7")
+    listdir = MagicMock()
+    monkeypatch.setattr(worker.os, "listdir", listdir)
+
+    assert worker._configure_rank_local_rdma_bind_address("rdma3") == "10.9.8.7"
+    listdir.assert_not_called()
+
+
+def test_rank_local_rdma_prefers_own_mooncake_segment():
+    store = MagicMock()
+    store.get_hostname.return_value = "10.24.112.181:34567"
+
+    assert (
+        worker._resolve_preferred_segment(store, None, rank_local_rdma=True)
+        == "10.24.112.181:34567"
+    )
+
+
+def test_configured_preferred_segment_wins_for_rank_local_rdma():
+    store = MagicMock()
+
+    assert (
+        worker._resolve_preferred_segment(
+            store,
+            "store.example:1234",
+            rank_local_rdma=True,
+        )
+        == "store.example:1234"
+    )
+    store.get_hostname.assert_not_called()
+
+
 def test_config_pr40900_unchanged(tmp_path):
     """A literal PR-40900 config (no mode, no enable_offload, no preferred_segment)
     parses without raising and resolves to embedded mode."""
