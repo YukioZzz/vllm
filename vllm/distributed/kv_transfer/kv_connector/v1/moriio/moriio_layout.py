@@ -177,6 +177,27 @@ def get_layer_transfer_geometry(
     element_size = kv_cache.element_size()
     is_mla_cache = is_mla_cache_layer(layer_to_spec, layer_name)
 
+    if is_mla_cache and len(shape) == 3:
+        # Kimi-K3/ROCm MLA can expose the latent cache as
+        # [num_blocks, block_size, latent_dim]. This layout is used by the
+        # #53598 baked runtime; keep it alongside the newer standardized 4-D
+        # AttentionSpec layout so a MoRIIO overlay does not regress that image.
+        num_blocks, block_size, latent_dim = shape
+        slot_size_bytes = latent_dim * element_size
+        block_len = block_size * slot_size_bytes
+        return LayerTransferGeometry(
+            num_blocks=num_blocks,
+            block_size=block_size,
+            block_len=block_len,
+            slot_size_bytes=slot_size_bytes,
+            block_stride=stride[0],
+            local_kv_stride=None,
+            remote_kv_stride=None,
+            transfers_per_block=1,
+            regions_per_block=1,
+            split_kv_regions=False,
+        )
+
     if not is_mla_cache and len(shape) == 5 and shape[0] == 2:
         _, num_blocks = shape[:2]
         kernel_blocks_per_block = 1
