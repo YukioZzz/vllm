@@ -265,6 +265,7 @@ def _cp_lse_common(
     is_lse_base_on_e=True,
     seq_lens: torch.Tensor | None = None,
     query_start_loc: torch.Tensor | None = None,
+    skip_empty_shard_mask: bool = False,
 ):
     """
     cp_attn_out: [ B, H, D ]
@@ -277,7 +278,8 @@ def _cp_lse_common(
         ctx = CPTritonContext()
 
     cp_attn_lse = cp_attn_lse.contiguous()
-    mask_dcp_empty_shards_(cp_attn_lse, seq_lens, query_start_loc)
+    if not skip_empty_shard_mask:
+        mask_dcp_empty_shards_(cp_attn_lse, seq_lens, query_start_loc)
     lses = cp_group.all_gather(cp_attn_lse, dim=0).reshape(
         (cp_group.world_size,) + cp_attn_lse.shape
     )
@@ -300,6 +302,7 @@ def cp_lse_ag_out_rs(
     is_lse_base_on_e=True,
     seq_lens: torch.Tensor | None = None,
     query_start_loc: torch.Tensor | None = None,
+    skip_empty_shard_mask: bool = False,
 ):
     """
     cp_attn_out: [ B, H, D ]
@@ -313,6 +316,7 @@ def cp_lse_ag_out_rs(
         is_lse_base_on_e=is_lse_base_on_e,
         seq_lens=seq_lens,
         query_start_loc=query_start_loc,
+        skip_empty_shard_mask=skip_empty_shard_mask,
     )
     out = cp_group.reduce_scatter(out, dim=1)
 
@@ -333,6 +337,7 @@ def cp_lse_ag_out_ar(
     is_lse_base_on_e=True,
     seq_lens: torch.Tensor | None = None,
     query_start_loc: torch.Tensor | None = None,
+    skip_empty_shard_mask: bool = False,
 ):
     """
     cp_attn_out: [ B, H, D ]
@@ -346,6 +351,7 @@ def cp_lse_ag_out_ar(
         is_lse_base_on_e=is_lse_base_on_e,
         seq_lens=seq_lens,
         query_start_loc=query_start_loc,
+        skip_empty_shard_mask=skip_empty_shard_mask,
     )
     out = cp_group.all_reduce(out)
 
@@ -497,6 +503,8 @@ def _dcp_a2a_pack_send_kernel(
     out_ptr,
     lse_ptr,
     send_ptr,
+    seq_lens_ptr,
+    query_start_loc_ptr,
     out_stride_B,
     out_stride_H,
     out_stride_D,
@@ -510,10 +518,23 @@ def _dcp_a2a_pack_send_kernel(
     HEAD_DIM: tl.constexpr,
     H_PER_RANK: tl.constexpr,
     LSE_PACK_DIM: tl.constexpr,
+    HAS_EMPTY_MASK: tl.constexpr,
+    NUM_SEQS: tl.constexpr,
 ):
     batch_idx = tl.program_id(0).to(tl.int64)
     local_head_idx = tl.program_id(1).to(tl.int64)
     d_offsets = tl.arange(0, HEAD_DIM)
+
+    empty_kv = False
+    if HAS_EMPTY_MASK:
+        last_query = tl.load(query_start_loc_ptr + NUM_SEQS)
+        empty_kv = batch_idx >= last_query
+        for seq_idx in tl.static_range(0, NUM_SEQS):
+            seq_start = tl.load(query_start_loc_ptr + seq_idx)
+            seq_end = tl.load(query_start_loc_ptr + seq_idx + 1)
+            in_seq = (batch_idx >= seq_start) & (batch_idx < seq_end)
+            seq_len = tl.load(seq_lens_ptr + seq_idx)
+            empty_kv = tl.where(in_seq, seq_len == 0, empty_kv)
 
     for rank_idx in tl.static_range(N):
         src_head_idx = rank_idx * H_PER_RANK + local_head_idx
@@ -531,11 +552,13 @@ def _dcp_a2a_pack_send_kernel(
         tl.store(
             send_ptr + send_base + d_offsets * send_stride_D,
             tl.load(out_ptr + out_offsets),
+            mask=~empty_kv,
         )
 
         lse_val = tl.load(
             lse_ptr + batch_idx * lse_stride_B + src_head_idx * lse_stride_H
         ).to(tl.float32)
+        lse_val = tl.where(empty_kv, -float("inf"), lse_val)
         if LSE_PACK_DIM == 1:
             tl.store(
                 send_ptr + send_base + HEAD_DIM * send_stride_D,
@@ -690,13 +713,30 @@ def _dcp_a2a_pack_send(
     lse_pack_dim: int,
     seq_lens: torch.Tensor | None = None,
     query_start_loc: torch.Tensor | None = None,
+    skip_empty_shard_mask: bool = False,
 ) -> None:
-    mask_dcp_empty_shards_(cp_attn_lse, seq_lens, query_start_loc)
+    if seq_lens is None or query_start_loc is None:
+        if seq_lens is not None or query_start_loc is not None:
+            raise ValueError("seq_lens and query_start_loc must be provided together")
+        has_empty_mask = False
+    elif skip_empty_shard_mask:
+        has_empty_mask = False
+    elif seq_lens.shape[0] <= 16:
+        has_empty_mask = True
+    else:
+        cp_attn_lse = cp_attn_lse.contiguous()
+        mask_dcp_empty_shards_(cp_attn_lse, seq_lens, query_start_loc)
+        has_empty_mask = False
+
+    seq_lens_arg = seq_lens if seq_lens is not None else cp_attn_lse
+    query_start_loc_arg = query_start_loc if query_start_loc is not None else cp_attn_lse
     grid = (cp_attn_out.shape[0], h_per_rank, 1)
     _dcp_a2a_pack_send_kernel[grid](
         cp_attn_out,
         cp_attn_lse,
         send_buffer,
+        seq_lens_arg,
+        query_start_loc_arg,
         cp_attn_out.stride(0),
         cp_attn_out.stride(1),
         cp_attn_out.stride(2),
@@ -710,6 +750,8 @@ def _dcp_a2a_pack_send(
         HEAD_DIM=head_dim,
         H_PER_RANK=h_per_rank,
         LSE_PACK_DIM=lse_pack_dim,
+        HAS_EMPTY_MASK=has_empty_mask,
+        NUM_SEQS=seq_lens.shape[0] if has_empty_mask else 1,
     )
 
 
@@ -765,6 +807,7 @@ def dcp_a2a_lse_reduce(
     is_lse_base_on_e: bool = True,
     seq_lens: torch.Tensor | None = None,
     query_start_loc: torch.Tensor | None = None,
+    skip_empty_shard_mask: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Combine partial attention outputs across DCP ranks using All-to-All.
@@ -815,6 +858,7 @@ def dcp_a2a_lse_reduce(
         lse_pack_dim,
         seq_lens=seq_lens,
         query_start_loc=query_start_loc,
+        skip_empty_shard_mask=skip_empty_shard_mask,
     )
 
     work = dist.all_to_all_single(
@@ -1269,6 +1313,7 @@ class DCPCombine(Protocol):
         *,
         seq_lens: torch.Tensor,
         query_start_loc: torch.Tensor,
+        skip_empty_shard_mask: bool = False,
     ) -> torch.Tensor: ...
 
 
@@ -1363,11 +1408,14 @@ class MLADCPManager:
         is_lse_base_on_e: bool,
         seq_lens: torch.Tensor | None = None,
         query_start_loc: torch.Tensor | None = None,
+        skip_empty_shard_mask: bool = False,
     ) -> torch.Tensor:
         # Forced MQA path pass all batch tokens (including prefill) into combine,
         # which may exceed the direct symmetric-memory workspace. Fall back to
         # the nccl a2a combine for those cases.
         if partial_output.shape[0] <= direct_workspace.max_num_tokens:
+            if skip_empty_shard_mask:
+                seq_lens = query_start_loc = None
             return direct_workspace.lse_reduce(
                 partial_output,
                 partial_lse,
@@ -1382,6 +1430,7 @@ class MLADCPManager:
             is_lse_base_on_e=is_lse_base_on_e,
             seq_lens=seq_lens,
             query_start_loc=query_start_loc,
+            skip_empty_shard_mask=skip_empty_shard_mask,
         )
 
     def _init_query_gather(
