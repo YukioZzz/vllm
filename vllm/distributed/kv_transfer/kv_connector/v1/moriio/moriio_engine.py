@@ -74,11 +74,18 @@ except ImportError:
 _MAX_TERMINAL_TRANSFER_IDS = 4096
 
 
-WriteGeometryKey = tuple[tuple[int, ...], tuple[int, ...], torch.dtype]
+WriteGeometryKey = tuple[tuple[int, ...], tuple[int, ...], torch.dtype, int]
 
 
-def _get_write_geometry_key(kv_cache: torch.Tensor) -> WriteGeometryKey:
-    return (tuple(kv_cache.shape), tuple(kv_cache.stride()), kv_cache.dtype)
+def _get_write_geometry_key(
+    kv_cache: torch.Tensor, attn_group_pos: int = -1
+) -> WriteGeometryKey:
+    return (
+        tuple(kv_cache.shape),
+        tuple(kv_cache.stride()),
+        kv_cache.dtype,
+        attn_group_pos,
+    )
 
 
 class MoRIIOWriter:
@@ -397,23 +404,35 @@ class MoRIIOWriter:
             return self._prepare_mamba_transfer_plan(task, request_info)
 
         layer_cache = self.worker.kv_caches[task.layer_name]
-        geometry_key = _get_write_geometry_key(layer_cache)
+        geometry_key = _get_write_geometry_key(
+            layer_cache,
+            self.worker._layer_to_attn_group_pos.get(task.layer_name, -1),
+        )
         offsets = request_info.transfer_offsets.get(geometry_key)
         if offsets is None:
             # local/remote block ids carry [attn, mamba]; attention layers use
             # the attention half.
-            local_attn, _ = as_attn_mamba(task.local_block_ids)
-            remote_attn, _ = as_attn_mamba(request_info.block_ids)
-            offsets = self.worker._compute_block_transfer_offsets(
-                task.layer_name,
-                local_attn,
-                remote_attn,
-                remote_moriio_meta,
-                # The producer performs the DCP relayout, so it needs the
-                # consumer's degree; the decoder reported it with its blocks.
-                decode_dcp_size=request_info.decode_dcp_size,
+            local_attn = self.worker._select_attention_blocks_for_layer(
+                task.layer_name, task.local_block_ids
             )
-            request_info.transfer_offsets[geometry_key] = offsets
+            remote_attn = self.worker._select_attention_blocks_for_layer(
+                task.layer_name, request_info.block_ids
+            )
+            if not local_attn or not remote_attn:
+                offsets = ([], [], [])
+                request_info.transfer_offsets[geometry_key] = offsets
+            else:
+                offsets = self.worker._compute_block_transfer_offsets(
+                    task.layer_name,
+                    local_attn,
+                    remote_attn,
+                    remote_moriio_meta,
+                    # The producer performs the DCP relayout, so it needs the
+                    # consumer's degree; the decoder reported it with its blocks.
+                    decode_dcp_size=request_info.decode_dcp_size,
+                    num_prompt_tokens=task.num_prompt_tokens,
+                )
+                request_info.transfer_offsets[geometry_key] = offsets
 
         # One session per registered region; attention layers map to a single
         # index (see MoRIIOConnectorWorker._region_session_indices).
