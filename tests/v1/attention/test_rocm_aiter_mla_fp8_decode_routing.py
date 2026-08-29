@@ -4,10 +4,11 @@
 
 Gluon exposes a single fp8-KV regime, bh16bn128. It is a bf16-query kernel that
 upcasts the cache in registers with a hardcoded scale of 1.0, and it asserts
-batch_size == 1, so it cannot serve a decode batch. Every fp8 shape therefore
-has to land on the asm kernels, which ship real fp8 variants for gqa=16. These
-tests pin that down at the predicates, since the failure it prevents is either a
-batch assertion or -- worse -- a silently wrong result.
+batch_size == 1, so non-DCP fp8 batches have to land on the asm kernels, which
+ship real fp8 variants for gqa=16. DCP multi-token verification is the exception:
+it flattens the verify block into per-token rows and asks Gluon for per-row LSE.
+These tests pin that down at the predicates, since the failure it prevents is
+either a batch assertion or -- worse -- a silently wrong result.
 """
 
 import pytest
@@ -35,14 +36,17 @@ def gluon_available(monkeypatch):
     reasons that have nothing to do with what these tests cover.
     """
     monkeypatch.setattr(rocm_aiter_mla, "_gluon_mla_decode_supported", lambda: True)
+    monkeypatch.setattr(
+        rocm_aiter_mla, "_triton_supports_dcp_gluon_verify", lambda: True
+    )
     monkeypatch.setattr(rocm_aiter_mla, "_aiter_mla_small_head_mode", lambda: "auto")
 
 
 @pytest.mark.parametrize("kv_cache_dtype", FP8_DTYPES)
 @pytest.mark.parametrize("num_heads", [1, 2, 4, 5, 6, 8, 12, 16, 32, 128])
 @pytest.mark.parametrize("max_qo_len", [1, 2, 4, 5, 8, 15])
-def test_fp8_never_routes_to_gluon(kv_cache_dtype, num_heads, max_qo_len):
-    """No fp8 shape reaches either Gluon entry point.
+def test_non_dcp_fp8_never_routes_to_gluon(kv_cache_dtype, num_heads, max_qo_len):
+    """No non-DCP fp8 shape reaches either Gluon entry point.
 
     The head count is deliberately swept across divisors of 16 as well as
     non-divisors: the divisor case (e.g. 8 heads at TP8) is the one that stays
@@ -58,7 +62,7 @@ def test_fp8_never_routes_to_gluon(kv_cache_dtype, num_heads, max_qo_len):
 def test_fp8_never_routes_to_gluon_under_any_mode(
     monkeypatch, kv_cache_dtype, num_heads, mode
 ):
-    """VLLM_ROCM_AITER_MLA_ASM_PADDING cannot force an fp8 cache onto Gluon.
+    """The mode knob cannot force a non-DCP fp8 cache onto Gluon.
 
     The dtype guard deliberately precedes the mode knob: honouring an explicit
     "gluon" request under fp8 would hand Gluon the batch it asserts against, so
@@ -93,12 +97,33 @@ def test_gathered_head_counts_only_reach_gluon_verify_under_dcp(
     these head counts and is faster, so the bound must stay where it was --
     DeepSeek-R1 at TP8 (16 local heads) with MTP keeps the asm path.
     """
-    monkeypatch.setattr(rocm_aiter_mla, "_gluon_mla_max_bh16_heads", lambda: 96)
-
     assert not AiterMLAHelper.use_gluon_verify(num_heads, max_qo_len, "bfloat16")
     assert AiterMLAHelper.use_gluon_verify(
         num_heads, max_qo_len, "bfloat16", dcp_world_size=8
     )
+    assert AiterMLAHelper.use_gluon_verify(
+        num_heads, max_qo_len, "fp8", dcp_world_size=8
+    )
+
+
+@pytest.mark.parametrize(
+    "triton_version, expected",
+    [
+        ("3.6.0", False),
+        ("3.6.1", False),
+        ("3.7.0", True),
+        ("3.7.1+gitabcdef", True),
+    ],
+)
+def test_dcp_gluon_verify_triton_version_gate(
+    monkeypatch, triton_version, expected
+):
+    monkeypatch.setattr(rocm_aiter_mla.triton, "__version__", triton_version)
+    rocm_aiter_mla._triton_supports_dcp_gluon_verify.cache_clear()
+    try:
+        assert rocm_aiter_mla._triton_supports_dcp_gluon_verify() is expected
+    finally:
+        rocm_aiter_mla._triton_supports_dcp_gluon_verify.cache_clear()
 
 
 @pytest.mark.parametrize("kv_cache_dtype", UNQUANTIZED_DTYPES)
