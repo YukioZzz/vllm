@@ -901,16 +901,8 @@ class RocmPlatform(Platform):
         parallel_config = vllm_config.parallel_config
 
         if compilation_config.cudagraph_mode.has_full_cudagraphs():
-            # decode context parallel does not support full cudagraphs
-            if parallel_config.decode_context_parallel_size > 1:
-                logger.warning_once(
-                    "Decode context parallel (DCP) is enabled, which is "
-                    "incompatible with full CUDA graphs. "
-                    "Overriding cudagraph_mode to PIECEWISE."
-                )
-                compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
             # prefill context parallel do not support full cudagraphs
-            elif parallel_config.prefill_context_parallel_size > 1:
+            if parallel_config.prefill_context_parallel_size > 1:
                 logger.warning_once(
                     "Prefill context parallel (PCP) is enabled, which is "
                     "incompatible with full CUDA graphs. "
