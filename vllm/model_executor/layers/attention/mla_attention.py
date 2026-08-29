@@ -2413,25 +2413,22 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                     )
                 dcp_tot_seq_lens_device = seq_lens[:num_decodes]
                 seq_lens = dcp_local_seq_lens
-                dcp_local_seq_lens_cpu = common_attn_metadata.dcp_local_seq_lens_cpu
-                if dcp_local_seq_lens_cpu is not None:
-                    decode_query_start_loc_cpu = query_start_loc_cpu[: num_decodes + 1]
-                    query_lens_cpu = (
-                        decode_query_start_loc_cpu[1:] - decode_query_start_loc_cpu[:-1]
+                # Use device-side lengths for this decision. CPU optimistic
+                # lengths can be stale on speculative paths and may
+                # incorrectly skip empty-shard masking.
+                decode_query_start_loc = query_start_loc[: num_decodes + 1]
+                query_lens = decode_query_start_loc[1:] - decode_query_start_loc[:-1]
+                active_reqs = query_lens > 0
+                no_padding_rows = int(decode_query_start_loc[-1].item()) == int(
+                    num_decode_tokens
+                )
+                no_empty_dcp_shards = (
+                    no_padding_rows
+                    and bool(torch.any(active_reqs).item())
+                    and bool(
+                        torch.all(dcp_local_seq_lens[:num_decodes][active_reqs] > 0).item()
                     )
-                    active_reqs = query_lens_cpu > 0
-                    no_padding_rows = (
-                        int(decode_query_start_loc_cpu[-1]) == num_decode_tokens
-                    )
-                    no_empty_dcp_shards = (
-                        no_padding_rows
-                        and bool(torch.any(active_reqs))
-                        and bool(
-                            torch.all(
-                                dcp_local_seq_lens_cpu[:num_decodes][active_reqs] > 0
-                            )
-                        )
-                    )
+                )
 
                 # After DCP distribution, the maximum number of tokens for any rank is
                 # ceil(L / (N * I)) * I, where L is max_seq_len, N is dcp_world_size,
