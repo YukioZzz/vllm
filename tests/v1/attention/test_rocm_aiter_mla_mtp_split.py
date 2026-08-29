@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 import sys
 from types import SimpleNamespace
 from unittest import mock
@@ -18,6 +19,9 @@ from vllm.v1.attention.backends.mla.rocm_aiter_mla import (  # noqa: E402
     AiterMLAHelper,
     AiterMLAMetadataBuilder,
 )
+from vllm.v1.attention.ops.rocm_aiter_mla_reduce import (  # noqa: E402
+    reduce_mla_segment_partials,
+)
 
 
 class _NoOpTritonKernel:
@@ -27,6 +31,19 @@ class _NoOpTritonKernel:
 
     def __call__(self, *args, **kwargs):
         pass
+
+
+def _lse_combine_natural(
+    out_a: torch.Tensor,
+    lse_a: torch.Tensor,
+    out_b: torch.Tensor,
+    lse_b: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    normalizer = torch.logaddexp(lse_a, lse_b)
+    out = out_a * torch.exp(lse_a - normalizer).unsqueeze(-1)
+    out += out_b * torch.exp(lse_b - normalizer).unsqueeze(-1)
+    return out.to(out_dtype), normalizer
 
 
 class _ExpandPageIndicesKernel:
@@ -67,10 +84,25 @@ def _builder(
     max_decode_rows: int = 32,
     num_heads: int = 16,
     kv_cache_dtype: str = "auto",
+    dcp_world_size: int = 1,
+    dcp_rank: int = 0,
 ):
-    return SimpleNamespace(
+    stub = SimpleNamespace(
         device=torch.device("cpu"),
         num_heads=num_heads,
+        # DCP gathers every rank's head shard before decode, and the routing
+        # predicates read the gathered count.
+        _decode_num_heads=num_heads * dcp_world_size,
+        dcp_world_size=dcp_world_size,
+        dcp_rank=dcp_rank,
+        cp_kv_cache_interleave_size=1,
+        _dcp_verify_graph_max_kv_seq_len=128,
+        _verify_row_indptr=None,
+        _verify_row_page_table=None,
+        _verify_row_lens=None,
+        _dcp_verify_block_table=None,
+        _dcp_verify_qo_indptr=None,
+        _graph_seq_lens=None,
         _kv_cache_dtype_str=kv_cache_dtype,
         paged_kv_last_page_len=torch.ones(max_decode_rows, dtype=torch.int32),
         paged_kv_indices=torch.empty(1024, dtype=torch.int32),
@@ -96,6 +128,18 @@ def _builder(
         _mla_kv_dtype=torch.bfloat16,
         decode_attn_out_dtype=torch.bfloat16,
     )
+    # Bound to the stub rather than faked: the verify flatten's per-row view is
+    # part of what _build_decode is being tested for.
+    stub._build_verify_row_view = (
+        AiterMLAMetadataBuilder._build_verify_row_view.__get__(stub)
+    )
+    stub._build_dcp_verify_row_view = (
+        AiterMLAMetadataBuilder._build_dcp_verify_row_view.__get__(stub)
+    )
+    stub._fill_dcp_verify_page_table = (
+        AiterMLAMetadataBuilder._fill_dcp_verify_page_table.__get__(stub)
+    )
+    return stub
 
 
 def test_backend_declares_uniform_batch_support():
@@ -109,6 +153,143 @@ def test_backend_declares_uniform_batch_support():
         AiterMLAMetadataBuilder._cudagraph_support
         == rocm_aiter_mla.AttentionCGSupport.UNIFORM_BATCH
     )
+
+
+def test_dcp_verify_row_view_is_causal_per_row():
+    """Row t must cover this rank's share of positions [0, seq_len - qlen + t].
+
+    Regression guard: giving every row of a request the committed prefix only
+    drops the whole verify block, including each row's own token, since nothing
+    else adds it back on the target path.
+    """
+    qlen = 4
+    builder = _builder(mtp_decode_qlen=qlen, dcp_world_size=2)
+    builder.kernel_block_size = 2
+    block_table = torch.tensor([[7, 8, 9], [10, 11, 12]], dtype=torch.int32)
+
+    pages, row_lens, qo_indptr, max_kv_len = builder._build_dcp_verify_row_view(
+        qlen,
+        block_table,
+        torch.tensor([10, 12], dtype=torch.int32),
+    )
+
+    # seq_len 10 -> rows see 7, 8, 9, 10 global positions, of which rank 0 of 2
+    # holds ceil(n / 2); seq_len 12 -> 9, 10, 11, 12.
+    assert row_lens.tolist() == [4, 4, 5, 5, 5, 5, 6, 6]
+    assert qo_indptr.tolist() == list(range(2 * qlen + 1))
+    # One query per row, so the page table is the request's ascending shard and
+    # only the row length selects the causal prefix.
+    assert pages.tolist() == [[7, 8, 9]] * qlen + [[10, 11, 12]] * qlen
+    assert max_kv_len == 6
+
+
+def test_dcp_verify_rows_sum_to_the_global_window_across_ranks():
+    """Every rank's rows together must cover each row's window exactly once."""
+    qlen = 4
+    dcp_world_size = 2
+    seq_lens = torch.tensor([10, 12], dtype=torch.int32)
+    per_rank = []
+    for dcp_rank in range(dcp_world_size):
+        builder = _builder(
+            mtp_decode_qlen=qlen,
+            dcp_world_size=dcp_world_size,
+            dcp_rank=dcp_rank,
+        )
+        builder.kernel_block_size = 2
+        _, row_lens, _, _ = builder._build_dcp_verify_row_view(
+            qlen,
+            torch.tensor([[7, 8, 9], [10, 11, 12]], dtype=torch.int32),
+            seq_lens,
+        )
+        per_rank.append(row_lens.tolist())
+
+    expected = [
+        int(seq_len) - qlen + t + 1 for seq_len in seq_lens.tolist() for t in range(qlen)
+    ]
+    assert [sum(lens) for lens in zip(*per_rank)] == expected
+
+
+def test_dcp_verify_row_view_uses_static_graph_bound():
+    qlen = 3
+    builder = _builder(
+        mtp_decode_qlen=qlen,
+        dcp_world_size=8,
+        has_full_cudagraphs=True,
+    )
+    builder.kernel_block_size = 1536
+    builder._dcp_verify_graph_max_kv_seq_len = 3072
+    builder._dcp_verify_block_table = torch.zeros((qlen, 24), dtype=torch.int32)
+    builder._dcp_verify_qo_indptr = torch.zeros(qlen + 1, dtype=torch.int32)
+    builder._verify_row_lens = torch.zeros(qlen, dtype=torch.int32)
+
+    pages, row_lens, qo_indptr, max_kv_len = builder._build_dcp_verify_row_view(
+        qlen,
+        torch.arange(2, dtype=torch.int32).view(1, 2),
+        torch.tensor([1000], dtype=torch.int32),
+    )
+
+    assert row_lens.tolist() == [125] * qlen
+    assert pages.data_ptr() == builder._dcp_verify_block_table.data_ptr()
+    assert qo_indptr.data_ptr() == builder._dcp_verify_qo_indptr.data_ptr()
+    assert pages[0].tolist() == list(range(24))
+    assert max_kv_len == 3072
+
+
+def test_non_dcp_verify_row_view_remains_causal():
+    qlen = 4
+    builder = _builder(mtp_decode_qlen=qlen)
+    indptr, pages, row_lens, _ = builder._build_verify_row_view(
+        qlen,
+        torch.tensor([0, 5], dtype=torch.int32),
+        torch.arange(5, dtype=torch.int32),
+    )
+
+    assert row_lens.tolist() == [2, 3, 4, 5]
+    assert indptr.tolist() == [0, 2, 5, 9, 14]
+    assert pages.tolist() == [0, 1, 0, 1, 2, 0, 1, 2, 3, 0, 1, 2, 3, 4]
+
+
+def test_verify_partial_attention_merge():
+    device = torch.device("cuda")
+    out_a = torch.tensor([[[1.0, 2.0]], [[3.0, 4.0]]], device=device)
+    out_b = torch.tensor([[[5.0, 6.0]], [[7.0, 8.0]]], device=device)
+    lse_a = torch.tensor([[0.0], [1.0]], device=device)
+    lse_b = torch.tensor([[1.0], [0.0]], device=device)
+
+    out, lse = _lse_combine_natural(out_a, lse_a, out_b, lse_b, torch.float32)
+    normalizer = torch.logaddexp(lse_a, lse_b)
+    expected = out_a * torch.exp(lse_a - normalizer).unsqueeze(-1) + out_b * torch.exp(
+        lse_b - normalizer
+    ).unsqueeze(-1)
+
+    torch.testing.assert_close(out, expected)
+    torch.testing.assert_close(lse, normalizer)
+
+
+def test_segmented_verify_reduce_returns_natural_lse_and_masks_empty_rows():
+    segment_output = torch.tensor(
+        [1.0, 3.0, 99.0, 99.0],
+        device="cuda",
+    ).reshape(2, 1, 2, 1)
+    segment_max = torch.tensor(
+        [[[0.0, 1.0]], [[99.0, 99.0]]],
+        device="cuda",
+    )
+    segment_expsum = torch.ones_like(segment_max)
+
+    output, lse = reduce_mla_segment_partials(
+        segment_output,
+        segment_max,
+        segment_expsum,
+        torch.tensor([2, 0], dtype=torch.int32, device="cuda"),
+        tile_size=1,
+        out_dtype=torch.float32,
+    )
+
+    torch.testing.assert_close(output[0], torch.tensor([[7.0 / 3]], device="cuda"))
+    assert output[1].item() == 0
+    torch.testing.assert_close(lse[0], torch.tensor([math.log(3.0)], device="cuda"))
+    assert lse[1].item() == float("-inf")
 
 
 @pytest.mark.parametrize("num_heads", [8, 16, 24, 32, 64, 128])
@@ -161,6 +342,8 @@ def test_mtp_builder_init_sizes_native_fp8_metadata(
 
     def init_common_builder(self, *args, **kwargs):
         self.num_heads = num_heads
+        self.dcp_world_size = 1
+        self.cp_kv_cache_interleave_size = 1
         # Mirror what _init_reorder_batch_threshold would have left behind: the
         # metadata is sized from the routing threshold, so a stub that skips it
         # would size for qlen=1 and hide the very mismatch this test covers.
@@ -190,12 +373,23 @@ def test_mtp_builder_init_sizes_native_fp8_metadata(
             num_speculative_tokens=3,
             parallel_drafting=parallel_drafting,
         ),
-        parallel_config=SimpleNamespace(tensor_parallel_size=8),
-        model_config=SimpleNamespace(max_model_len=16, dtype=torch.bfloat16),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=8,
+            decode_context_parallel_size=1,
+            cp_kv_cache_interleave_size=1,
+        ),
+        model_config=SimpleNamespace(
+            max_model_len=16,
+            dtype=torch.bfloat16,
+            get_num_attention_heads=lambda parallel_config: num_heads,
+        ),
         scheduler_config=SimpleNamespace(max_num_seqs=2),
         cache_config=SimpleNamespace(cache_dtype="fp8_e4m3"),
         compilation_config=SimpleNamespace(
-            cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: False)
+            cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: False),
+            # Empty: the per-layer head-count probe finds no attention layer and
+            # falls back to the model config above.
+            static_forward_context={},
         ),
     )
     builder = AiterMLAMetadataBuilder(
