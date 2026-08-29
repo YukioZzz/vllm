@@ -363,18 +363,30 @@ def test_fp8_verify_stays_on_the_asm_decode_without_dcp():
 
 
 @pytest.mark.parametrize("segmented_supported", [True, False])
-def test_fp8_verify_segmented_decode_gate(segmented_supported: bool):
-    """DCP fp8 verification requires segmented MLA support."""
+def test_fp8_dcp_verify_uses_segmented_only_on_old_triton(
+    segmented_supported: bool,
+):
+    """DCP fp8 verification prefers Gluon and keeps segmented for Triton <= 3.6."""
     from vllm.v1.attention.backends.mla.rocm_aiter_mla import AiterMLAHelper
 
     prefix = "vllm.v1.attention.backends.mla.rocm_aiter_mla."
     with (
         patch(prefix + "_gluon_mla_decode_supported", lambda: True),
         patch(prefix + "_gluon_mla_max_bh16_heads", lambda: 96),
+        patch(prefix + "_triton_supports_dcp_gluon_verify", lambda: True),
         patch(prefix + "_segmented_mla_decode_supported", lambda: segmented_supported),
     ):
-        got = AiterMLAHelper.use_gluon_verify(96, QLEN, "fp8", 8)
-    assert got is segmented_supported, (
-        "an fp8 DCP verify must take the segmented path exactly when the "
-        f"installed AITER supports it (support={segmented_supported}, got={got})"
-    )
+        assert AiterMLAHelper.use_gluon_verify(96, QLEN, "fp8", 8)
+        assert not AiterMLAHelper.use_segmented_dcp_verify(96, QLEN, "fp8", 8)
+
+    with (
+        patch(prefix + "_gluon_mla_decode_supported", lambda: True),
+        patch(prefix + "_gluon_mla_max_bh16_heads", lambda: 96),
+        patch(prefix + "_triton_supports_dcp_gluon_verify", lambda: False),
+        patch(prefix + "_segmented_mla_decode_supported", lambda: segmented_supported),
+    ):
+        assert not AiterMLAHelper.use_gluon_verify(96, QLEN, "fp8", 8)
+        assert (
+            AiterMLAHelper.use_segmented_dcp_verify(96, QLEN, "fp8", 8)
+            is segmented_supported
+        )

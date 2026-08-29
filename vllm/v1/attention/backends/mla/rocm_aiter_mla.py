@@ -182,6 +182,17 @@ def _segmented_mla_decode_supported() -> bool:
 
 
 @functools.lru_cache(maxsize=1)
+def _triton_supports_dcp_gluon_verify() -> bool:
+    """Whether this Triton build can compile the DCP Gluon verify flatten."""
+    version = getattr(triton, "__version__", "")
+    match = re.match(r"^(\d+)\.(\d+)", version)
+    if match is None:
+        return False
+    major, minor = int(match.group(1)), int(match.group(2))
+    return (major, minor) > (3, 6)
+
+
+@functools.lru_cache(maxsize=1)
 def _gluon_mla_wrapper_source() -> str | None:
     try:
         return inspect.getsource(_get_mla_gluon())
@@ -394,11 +405,19 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         ) * group_dcp_world_size
         supports_dcp_with_varlen = (
             parallel_config.cp_kv_cache_interleave_size == 1
-            and AiterMLAHelper.use_gluon_verify(
-                gathered_num_heads,
-                2,
-                vllm_config.cache_config.cache_dtype,
-                group_dcp_world_size,
+            and (
+                AiterMLAHelper.use_gluon_verify(
+                    gathered_num_heads,
+                    2,
+                    vllm_config.cache_config.cache_dtype,
+                    group_dcp_world_size,
+                )
+                or AiterMLAHelper.use_segmented_dcp_verify(
+                    gathered_num_heads,
+                    2,
+                    vllm_config.cache_config.cache_dtype,
+                    group_dcp_world_size,
+                )
             )
         )
         super().__init__(
@@ -582,33 +601,39 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
                 self._verify_row_lens = torch.zeros(
                     max_verify_rows, dtype=torch.int32, device=device
                 )
-                if self.dcp_world_size > 1:
-                    segmented_page_size = _segmented_mla_page_size(
-                        self.kernel_block_size
-                    )
-                    max_local_pages = cdiv(
-                        self._dcp_verify_graph_max_kv_seq_len,
-                        segmented_page_size,
-                    )
-                    self._dcp_verify_block_table = torch.zeros(
-                        (max_verify_rows, max_local_pages),
-                        dtype=torch.int32,
-                        device=device,
-                    )
-                    self._dcp_verify_qo_indptr = torch.arange(
-                        max_verify_rows + 1,
-                        dtype=torch.int32,
-                        device=device,
-                    )
-                else:
-                    self._verify_row_indptr = torch.zeros(
-                        max_verify_rows + 1, dtype=torch.int32, device=device
-                    )
-                    self._verify_row_page_table = torch.zeros(
-                        max_verify_rows * max_num_pages_per_req,
-                        dtype=torch.int32,
-                        device=device,
-                    )
+                self._verify_row_indptr = torch.zeros(
+                    max_verify_rows + 1, dtype=torch.int32, device=device
+                )
+                self._verify_row_page_table = torch.zeros(
+                    max_verify_rows * max_num_pages_per_req,
+                    dtype=torch.int32,
+                    device=device,
+                )
+            elif AiterMLAHelper.use_segmented_dcp_verify(
+                self._decode_num_heads,
+                self._mtp_decode_qlen,
+                self._kv_cache_dtype_str,
+                self.dcp_world_size,
+            ):
+                max_verify_rows = max_num_reqs * self._mtp_decode_qlen
+                self._verify_row_lens = torch.zeros(
+                    max_verify_rows, dtype=torch.int32, device=device
+                )
+                segmented_page_size = _segmented_mla_page_size(self.kernel_block_size)
+                max_local_pages = cdiv(
+                    self._dcp_verify_graph_max_kv_seq_len,
+                    segmented_page_size,
+                )
+                self._dcp_verify_block_table = torch.zeros(
+                    (max_verify_rows, max_local_pages),
+                    dtype=torch.int32,
+                    device=device,
+                )
+                self._dcp_verify_qo_indptr = torch.arange(
+                    max_verify_rows + 1,
+                    dtype=torch.int32,
+                    device=device,
+                )
 
     def _init_fp8_prefill_ps_buffers(
         self,
@@ -836,15 +861,30 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         qlen: int,
         paged_kv_indptr: torch.Tensor,
         paged_kv_indices: torch.Tensor,
+        dcp_tot_seq_lens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        """Flatten a non-DCP verify into one causal paged-KV row per token."""
-        assert self.dcp_world_size == 1
+        """Flatten a uniform verify into one causal paged-KV row per token.
+
+        Under DCP the row boundary is counted in global positions and then
+        mapped onto this rank's KV shard. The resulting local row still indexes
+        a causal prefix of the request's local page slice.
+        """
         num_reqs = paged_kv_indptr.numel() - 1
         device = paged_kv_indptr.device
-        seq_lens = paged_kv_indptr[1:] - paged_kv_indptr[:-1]
-        offsets = torch.arange(qlen, device=device, dtype=seq_lens.dtype)
-        row_lens = (
-            (seq_lens.unsqueeze(1) - (qlen - 1) + offsets).clamp_min_(0).flatten()
+        if self.dcp_world_size > 1:
+            assert dcp_tot_seq_lens is not None, (
+                "DCP verify needs the global sequence lengths to place each "
+                "row's causal window on this rank's KV shard."
+            )
+            row_len_source = dcp_tot_seq_lens[:num_reqs]
+        else:
+            row_len_source = paged_kv_indptr[1:] - paged_kv_indptr[:-1]
+        row_lens = AiterMLAHelper.dcp_local_verify_row_lens(
+            row_len_source,
+            qlen,
+            self.dcp_world_size,
+            self.dcp_rank,
+            self.cp_kv_cache_interleave_size,
         )
         row_indptr = torch.cat([paged_kv_indptr.new_zeros(1), row_lens.cumsum(0)]).to(
             torch.int32
@@ -1051,7 +1091,13 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             self._kv_cache_dtype_str,
             self.dcp_world_size,
         )
-        skip_paged_kv_expand = use_gluon_verify and self.dcp_world_size > 1
+        use_segmented_dcp_verify = AiterMLAHelper.use_segmented_dcp_verify(
+            self._decode_num_heads,
+            int(max_qo_len),
+            self._kv_cache_dtype_str,
+            self.dcp_world_size,
+        )
+        skip_paged_kv_expand = use_segmented_dcp_verify
 
         if not skip_paged_kv_expand:
             if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
@@ -1112,6 +1158,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         can_asm_qlen_pad = (
             not use_gluon_decode
             and not use_gluon_verify
+            and not use_segmented_dcp_verify
             and asm_kernel_qlen is not None
             and asm_kernel_qlen > max_qo_len
             and (pad_uniform_mtp or torch.all(qo_len == max_qo_len))
@@ -1125,6 +1172,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         use_persistent_metadata = (
             not use_gluon_decode
             and not use_gluon_verify
+            and not use_segmented_dcp_verify
             # A padded rank has no bf16 persistent kernel past qlen 4 where the
             # gfx950 fold is absent; the non-persistent entry covers it. fp8
             # keeps the schedule -- its fold rejects non-persistent outright.
@@ -1174,29 +1222,29 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         dcp_verify_block_table = dcp_verify_qo_indptr = None
         dcp_verify_max_kv_seq_len = 1
         if use_gluon_verify:
-            if self.dcp_world_size > 1:
-                assert dcp_tot_seq_lens_device is not None
-                (
-                    dcp_verify_block_table,
-                    row_lens,
-                    dcp_verify_qo_indptr,
-                    dcp_verify_max_kv_seq_len,
-                ) = self._build_dcp_verify_row_view(
-                    int(max_qo_len),
-                    block_table_tensor,
-                    dcp_tot_seq_lens_device,
-                )
-            else:
-                (
-                    row_indptr,
-                    row_page_table,
-                    row_lens,
-                    min_row_kv_len,
-                ) = self._build_verify_row_view(
-                    int(max_qo_len),
-                    paged_kv_indptr,
-                    paged_kv_indices,
-                )
+            (
+                row_indptr,
+                row_page_table,
+                row_lens,
+                min_row_kv_len,
+            ) = self._build_verify_row_view(
+                int(max_qo_len),
+                paged_kv_indptr,
+                paged_kv_indices,
+                dcp_tot_seq_lens_device,
+            )
+        elif use_segmented_dcp_verify:
+            assert dcp_tot_seq_lens_device is not None
+            (
+                dcp_verify_block_table,
+                row_lens,
+                dcp_verify_qo_indptr,
+                dcp_verify_max_kv_seq_len,
+            ) = self._build_dcp_verify_row_view(
+                int(max_qo_len),
+                block_table_tensor,
+                dcp_tot_seq_lens_device,
+            )
 
         attn_metadata = AiterMLADecodeMetadata(
             block_table=block_table_tensor,
@@ -1558,11 +1606,15 @@ class AiterMLAHelper:
         kv_cache_dtype: str,
         dcp_world_size: int = 1,
     ) -> bool:
-        """Whether multi-token verification uses a decode-kernel path."""
+        """Whether multi-token verification is flattened onto Gluon."""
         if max_qo_len <= 1:
             return False
         if dcp_world_size > 1:
-            return _segmented_mla_decode_supported()
+            if not _triton_supports_dcp_gluon_verify():
+                return False
+            if num_heads > AiterMLAHelper._gluon_max_heads(dcp_world_size):
+                return False
+            return _gluon_mla_decode_supported()
         if is_quantized_kv_cache(kv_cache_dtype):
             return False
         if num_heads > AiterMLAHelper._gluon_max_heads(dcp_world_size):
@@ -1570,6 +1622,43 @@ class AiterMLAHelper:
         if not _gluon_mla_decode_supported():
             return False
         return _aiter_mla_small_head_mode() != "asm"
+
+    @staticmethod
+    def use_segmented_dcp_verify(
+        num_heads: int,
+        max_qo_len: int,
+        kv_cache_dtype: str,
+        dcp_world_size: int = 1,
+    ) -> bool:
+        """Whether DCP verification should use segmented MLA fallback."""
+        del num_heads, kv_cache_dtype
+        if max_qo_len <= 1 or dcp_world_size <= 1:
+            return False
+        if _triton_supports_dcp_gluon_verify():
+            return False
+        return _segmented_mla_decode_supported()
+
+    @staticmethod
+    def dcp_local_verify_row_lens(
+        tot_seq_lens: torch.Tensor,
+        qlen: int,
+        dcp_world_size: int,
+        dcp_rank: int,
+        cp_interleave: int,
+    ) -> torch.Tensor:
+        offsets = torch.arange(
+            1,
+            qlen + 1,
+            device=tot_seq_lens.device,
+            dtype=tot_seq_lens.dtype,
+        )
+        visible = (tot_seq_lens.unsqueeze(1) - qlen + offsets).clamp_(min=0)
+        return get_dcp_local_seq_lens(
+            visible,
+            dcp_world_size,
+            dcp_rank,
+            cp_interleave,
+        ).flatten()
 
 
 class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
@@ -1995,15 +2084,6 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
                 if q_nope.dtype != torch.bfloat16:
                     q_nope = q_nope.to(torch.bfloat16) * layer._q_scale
                     q_pe = q_pe.to(torch.bfloat16) * layer._q_scale
-            if self.dcp_world_size > 1:
-                return self._forward_segmented_dcp_verify(
-                    q_nope,
-                    q_pe,
-                    row_lens,
-                    kv_c_and_k_pe_cache,
-                    decode,
-                    layer,
-                )
             o = torch.empty(
                 B,
                 num_q_heads,
@@ -2014,7 +2094,8 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
 
             kv_buffer = kv_c_and_k_pe_cache.reshape(-1, kv_c_and_k_pe_cache.shape[-1])
             mla_gluon = _get_mla_gluon()
-            mla_gluon(
+            need_lse = self.dcp_world_size > 1
+            gluon_ret = mla_gluon(
                 q_nope=q_nope,
                 q_pe=q_pe,
                 kv_c=kv_buffer,
@@ -2029,9 +2110,51 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
                 # a tensor would arrive as a pointer.
                 kv_scale=kv_scale,
                 min_kv_seq_len=decode.verify_min_kv_seq_len,
-                return_lse=False,
+                return_lse=need_lse,
             )
-            return o, None
+            if not need_lse:
+                return o, None
+            lse = gluon_ret[1] if isinstance(gluon_ret, tuple) else None
+            assert lse is not None, (
+                "aiter mla_gluon(return_lse=True) returned no LSE; upgrade aiter "
+                "to a build with gluon LSE support."
+            )
+            empty_rows = (row_lens == 0).unsqueeze(1)
+            lse = lse.reshape(B, num_q_heads).masked_fill(empty_rows, float("-inf"))
+            o = o.masked_fill(empty_rows.unsqueeze(2), 0)
+            return o, lse
+
+        if AiterMLAHelper.use_segmented_dcp_verify(
+            self._decode_num_heads,
+            int(decode.max_qo_len),
+            self.kv_cache_dtype,
+            self.dcp_world_size,
+        ):
+            row_lens = decode.verify_row_lens
+            assert row_lens is not None, (
+                "the DCP verify's per-row segmented view is missing; the "
+                "builder and the impl disagree on whether segmented MLA runs."
+            )
+            if type(q) is tuple:
+                q_nope, q_pe = q
+            else:
+                q_nope, q_pe = torch.split(
+                    q, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+                )
+            if (
+                is_quantized_kv_cache(self.kv_cache_dtype)
+                and q_nope.dtype != torch.bfloat16
+            ):
+                q_nope = q_nope.to(torch.bfloat16) * layer._q_scale
+                q_pe = q_pe.to(torch.bfloat16) * layer._q_scale
+            return self._forward_segmented_dcp_verify(
+                q_nope,
+                q_pe,
+                row_lens,
+                kv_c_and_k_pe_cache,
+                decode,
+                layer,
+            )
 
         if type(q) is tuple:
             q = torch.cat(q, dim=-1)

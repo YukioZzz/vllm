@@ -248,6 +248,92 @@ def test_non_dcp_verify_row_view_remains_causal():
     assert pages.tolist() == [0, 1, 0, 1, 2, 0, 1, 2, 3, 0, 1, 2, 3, 4]
 
 
+def test_dcp_gluon_verify_row_view_uses_global_causal_boundary():
+    qlen = 4
+    builder = _builder(mtp_decode_qlen=qlen, dcp_world_size=2)
+    indptr, pages, row_lens, _ = builder._build_verify_row_view(
+        qlen,
+        torch.tensor([0, 5, 11], dtype=torch.int32),
+        torch.arange(11, dtype=torch.int32),
+        torch.tensor([10, 12], dtype=torch.int32),
+    )
+
+    # seq_len 10 -> rows see 7, 8, 9, 10 global positions, of which rank 0 of 2
+    # holds ceil(n / 2); seq_len 12 -> rows see 9, 10, 11, 12.
+    assert row_lens.tolist() == [4, 4, 5, 5, 5, 5, 6, 6]
+    assert indptr.tolist() == [0, 4, 8, 13, 18, 23, 28, 34, 40]
+    assert pages.tolist() == (
+        [0, 1, 2, 3]
+        + [0, 1, 2, 3]
+        + [0, 1, 2, 3, 4]
+        + [0, 1, 2, 3, 4]
+        + [5, 6, 7, 8, 9]
+        + [5, 6, 7, 8, 9]
+        + [5, 6, 7, 8, 9, 10]
+        + [5, 6, 7, 8, 9, 10]
+    )
+
+
+def test_dcp_fp8_verify_build_prefers_gluon_on_new_triton(monkeypatch):
+    qlen = 4
+    monkeypatch.setattr(
+        rocm_aiter_mla,
+        "_expand_page_indices_kernel",
+        _ExpandPageIndicesKernel(),
+    )
+    monkeypatch.setattr(rocm_aiter_mla, "_gluon_mla_decode_supported", lambda: True)
+    monkeypatch.setattr(rocm_aiter_mla, "_gluon_mla_max_bh16_heads", lambda: 96)
+    monkeypatch.setattr(
+        rocm_aiter_mla, "_triton_supports_dcp_gluon_verify", lambda: True
+    )
+
+    metadata = AiterMLAMetadataBuilder._build_decode(
+        _builder(mtp_decode_qlen=qlen, dcp_world_size=2, kv_cache_dtype="fp8"),
+        block_table_tensor=torch.tensor([[0, 1, 2], [10, 11, 12]], dtype=torch.int32),
+        seq_lens_device=torch.tensor([5, 6], dtype=torch.int32),
+        max_seq_len=6,
+        query_start_loc_cpu=torch.tensor([0, qlen, 2 * qlen], dtype=torch.int32),
+        query_start_loc_device=torch.tensor([0, qlen, 2 * qlen], dtype=torch.int32),
+        num_decode_tokens=2 * qlen,
+        dcp_tot_seq_lens_device=torch.tensor([10, 12], dtype=torch.int32),
+    )
+
+    assert metadata.verify_row_indptr is not None
+    assert metadata.verify_row_page_table is not None
+    assert metadata.verify_row_lens is not None
+    assert metadata.dcp_verify_block_table is None
+
+
+def test_dcp_fp8_verify_build_uses_segmented_on_old_triton(monkeypatch):
+    qlen = 4
+    monkeypatch.setattr(rocm_aiter_mla, "_gluon_mla_decode_supported", lambda: True)
+    monkeypatch.setattr(
+        rocm_aiter_mla, "_triton_supports_dcp_gluon_verify", lambda: False
+    )
+    monkeypatch.setattr(rocm_aiter_mla, "_segmented_mla_decode_supported", lambda: True)
+
+    metadata = AiterMLAMetadataBuilder._build_decode(
+        _builder(
+            mtp_decode_qlen=qlen,
+            dcp_world_size=2,
+            kv_cache_dtype="fp8",
+            kernel_block_size=2,
+        ),
+        block_table_tensor=torch.tensor([[0, 1, 2], [10, 11, 12]], dtype=torch.int32),
+        seq_lens_device=torch.tensor([5, 6], dtype=torch.int32),
+        max_seq_len=6,
+        query_start_loc_cpu=torch.tensor([0, qlen, 2 * qlen], dtype=torch.int32),
+        query_start_loc_device=torch.tensor([0, qlen, 2 * qlen], dtype=torch.int32),
+        num_decode_tokens=2 * qlen,
+        dcp_tot_seq_lens_device=torch.tensor([10, 12], dtype=torch.int32),
+    )
+
+    assert metadata.verify_row_indptr is None
+    assert metadata.verify_row_page_table is None
+    assert metadata.verify_row_lens is not None
+    assert metadata.dcp_verify_block_table is not None
+
+
 def test_verify_partial_attention_merge():
     device = torch.device("cuda")
     out_a = torch.tensor([[[1.0, 2.0]], [[3.0, 4.0]]], device=device)
