@@ -45,7 +45,7 @@ from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
 )
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_dcp_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import (
@@ -63,6 +63,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    DCPGroupColumnParallelLinear,
     KimiK3MergedQKVGateLinear,
     MergedColumnParallelLinear,
     ReplicatedLinear,
@@ -98,7 +99,10 @@ from vllm.v1.attention.backend import (
     MLAAttentionImpl,
 )
 from vllm.v1.attention.backends.mla.prefill import get_mla_prefill_backend
-from vllm.v1.attention.ops.dcp import MLADCPManager
+from vllm.v1.attention.ops.dcp import (
+    MLADCPManager,
+    resolve_dcp_q_replicate,
+)
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec, get_kv_quant_mode
@@ -139,6 +143,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         aux_stream: torch.cuda.Stream | None = None,
         use_rope: bool = False,
         non_causal_multi_token_decode: bool = False,
+        enable_dcp_q_replicate: bool = True,
         run_gemm_rs_ar: bool = False,
     ) -> None:
         super().__init__()
@@ -197,6 +202,23 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         self.num_heads = num_heads
         self.num_local_heads = num_heads // tp_size
 
+        # Replicating the projection trades extra BMM work for one fewer
+        # collective per decode layer. Prefill remains TP-parallel.
+        parallel_config = get_current_vllm_config().parallel_config
+        self.q_replicate = enable_dcp_q_replicate and resolve_dcp_q_replicate(
+            parallel_config
+        )
+        q_head_proj_cls = (
+            DCPGroupColumnParallelLinear if self.q_replicate else ColumnParallelLinear
+        )
+        # Heads the query projection emits: the DCP group's set under
+        # replication, this rank's TP shard otherwise.
+        self.num_q_proj_heads = self.num_local_heads * (
+            parallel_config.decode_context_parallel_size if self.q_replicate else 1
+        )
+        # Group-wide W_UK_T for the replicated BMM1, filled at load time.
+        self.W_UK_T_dcp_qrep: torch.Tensor | None = None
+
         # ---- Pre-attention projections (fusable front-end) ----
         # Exactly one query layout is constructed below. Kimi-K3 uses q-LoRA;
         # Kimi-Linear uses independent full-rank Q and KV projections.
@@ -245,7 +267,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                     disable_tp=True,
                 )
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
-            self.q_b_proj = ColumnParallelLinear(
+            self.q_b_proj = q_head_proj_cls(
                 self.q_lora_rank,
                 self.num_heads * self.qk_head_dim,
                 bias=False,
@@ -255,7 +277,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
 
         # Kimi-Linear: Q and KV use independent full-rank input projections.
         else:
-            self.q_proj = ColumnParallelLinear(
+            self.q_proj = q_head_proj_cls(
                 self.hidden_size,
                 self.num_heads * self.qk_head_dim,
                 bias=False,
@@ -362,9 +384,12 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             self.impl.dcp_world_size = 1
             self.impl.dcp_rank = 0
         self.q_pad_num_heads = getattr(self.impl, "q_pad_num_heads", None)
+        assert not self.q_replicate or self.q_pad_num_heads is None, (
+            "DCP query replication is unsupported on a head-padding MLA backend "
+            "(q_pad_num_heads); the padding is sized for the gathered query."
+        )
 
         vllm_config = get_current_vllm_config()
-        parallel_config = vllm_config.parallel_config
         assert parallel_config.prefill_context_parallel_size == 1, (
             "Kimi-K3 MultiHeadLatentAttention does not support prefill context "
             "parallelism."
@@ -460,6 +485,13 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         replace_parameter(self, "W_UV", W_UV.transpose(0, 1), prefer_copy=True)
         # (L, N, P) -> (N, P, L)
         replace_parameter(self, "W_UK_T", W_UK.permute(1, 2, 0), prefer_copy=True)
+        if self.q_replicate:
+            # BMM1 absorbs the group's whole head set, so it needs every rank's
+            # W_UK_T. Gathered once here, not per step. W_UV stays local: the
+            # cross-rank merge hands each rank back its own heads.
+            self.W_UK_T_dcp_qrep = get_dcp_group().all_gather(
+                self.W_UK_T.contiguous(), dim=0
+            )
 
         quant_method = (
             self.quant_config.get_quant_method(self, prefix=self.layer_name)
@@ -479,6 +511,11 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         self.register_buffer(
             "_k_scale_inv", self._k_scale.reciprocal().reshape(1), persistent=False
         )
+
+    def _q_local_view(self, q: torch.Tensor) -> torch.Tensor:
+        """This rank's TP head shard of a group-wide (replicated) query."""
+        proj = self.q_b_proj if self.q_lora_rank is not None else self.q_proj
+        return proj._local_view(q)
 
     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor) -> None:
         """Project latent attention output back to ``v`` via ``W_UV`` (bmm)."""
@@ -533,7 +570,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             self.kv_a_layernorm.weight.data,
             self.rms_norm_eps,
         )
-        q = self.q_b_proj(q_c)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+        q = self.q_b_proj(q_c)[0].view(-1, self.num_q_proj_heads, self.qk_head_dim)
 
         attn_out = torch.empty(
             (hidden_states.shape[0], self.num_local_heads * self.v_head_dim),
@@ -603,7 +640,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         assert q_proj is not None
         assert kv_a_proj_with_mqa is not None
 
-        q = q_proj(hidden_states)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+        q = q_proj(hidden_states)[0].view(-1, self.num_q_proj_heads, self.qk_head_dim)
         kv_lora = kv_a_proj_with_mqa(hidden_states)[0]
         kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv_c_normed = self.kv_a_layernorm(kv_c)
@@ -684,8 +721,13 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
 
         # ---- Prefill: fused key-concat + cache-insert + attention ----
         if num_mha_tokens > 0:
+            prefill_q = q[num_mqa_tokens:]
+            if self.q_replicate:
+                # Prefill is TP-parallel over heads, so take this rank's shard
+                # back out of the group-wide query.
+                prefill_q = self._q_local_view(prefill_q)
             self._forward_prefill_fused(
-                q[num_mqa_tokens:],
+                prefill_q,
                 kv_c_normed[num_mqa_tokens:],
                 k_pe[num_mqa_tokens:],
                 rope_positions[num_mqa_tokens:] if rope_positions is not None else None,
@@ -701,7 +743,8 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
             )
             # BMM1: absorb q_nope into latent space. (N,B,P) x (N,P,L) -> (B,N,L)
-            ql_nope = torch.bmm(mqa_q_nope.transpose(0, 1), self.W_UK_T).transpose(0, 1)
+            W_UK_T = self.W_UK_T_dcp_qrep if self.q_replicate else self.W_UK_T
+            ql_nope = torch.bmm(mqa_q_nope.transpose(0, 1), W_UK_T).transpose(0, 1)
             # Fused: concat mqa_q = [ql_nope | q_pe] and insert the decode-token
             # latent into the paged cache (one launch, right before forward_mqa).
             mqa_q = self._decode_concat_cache(
@@ -713,7 +756,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 cos_sin_cache,
                 slot_mapping[:num_mqa_tokens],
             )
-            if self.dcp_world_size > 1:
+            if self.dcp_world_size > 1 and not self.q_replicate:
                 assert self.dcp_manager is not None
                 assert self.dcp_manager.query_gather is not None
                 mqa_q = self.dcp_manager.query_gather(mqa_q)
