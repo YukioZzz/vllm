@@ -67,6 +67,9 @@ class KVCacheCoordinator(ABC):
     """
 
     enable_partial_hash_hits = False
+    # Tokens the EAGLE/MTP last-unit drop removes from a candidate hit, or
+    # ``None`` when no group drops. Set by coordinators that support the drop.
+    _eagle_replay_drop_tokens: int | None = None
 
     def __init__(
         self,
@@ -299,6 +302,20 @@ class KVCacheCoordinator(ABC):
             )
             for manager in self.single_type_managers
         )
+
+    def eagle_replay_boundary(self, request: Request) -> int | None:
+        """Token position a later request replaying this prompt resumes at.
+
+        Under the EAGLE/MTP last-unit drop a consumer matches the prompt's last
+        reusable boundary and then drops one unit, so reusable state has to
+        exist one drop *below* that boundary rather than at it.
+
+        Returns ``None`` when that position is not separately materializable --
+        no group drops, or lookup is block-aligned so the split already stops at
+        the only reachable boundary -- in which case callers keep their existing
+        prompt-boundary behavior.
+        """
+        return None
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """
@@ -649,6 +666,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     "cache managers require block-aligned lookups: %s.",
                     ", ".join(sorted(unsupported_partial_hit_managers)),
                 )
+        cache_hit_alignment_tokens = self._cache_hit_alignment_tokens
+        for manager in self.single_type_managers:
+            manager.cache_hit_alignment_tokens = cache_hit_alignment_tokens
         self.verify_and_split_kv_cache_groups()
 
     @property
@@ -712,6 +732,56 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 for gid in group.group_ids:
                     self.single_type_managers[gid].use_eagle = True
 
+        # Widest drop among the dropping groups. A reconciled hit is the
+        # minimum over groups, so the widest drop decides the single position
+        # every group must be able to replay from. Mamba groups never drop
+        # (draft models have no mamba layers), so they do not contribute.
+        drop_units = [
+            self._eagle_drop_unit(
+                group.manager_cls,
+                self.single_type_managers[group.group_ids[0]].block_size,
+            )
+            for group in self.attention_groups
+            if group.use_eagle and not isinstance(group.spec, MambaSpec)
+        ]
+        self._eagle_replay_drop_tokens = max(drop_units, default=None)
+
+    def _eagle_drop_unit(
+        self,
+        manager_cls: type[SingleTypeKVCacheManager],
+        group_block_size: int,
+    ) -> int:
+        """Tokens an EAGLE/MTP group matches past the candidate and then drops.
+
+        Fine-grained managers drop a single hash unit; the rest drop one whole
+        cache block. Shared with ``find_longest_cache_hit`` so the boundary a
+        producer materializes cannot drift from the one a consumer lands on.
+        """
+        if (
+            self.enable_partial_hash_hits
+            and manager_cls.supports_fine_grained_hash_lookup
+            and group_block_size > self.hash_block_size
+        ):
+            return self.hash_block_size
+        return group_block_size
+
+    def eagle_replay_boundary(self, request: Request) -> int | None:
+        if self._eagle_replay_drop_tokens is None:
+            return None
+        if not self.enable_partial_hash_hits:
+            # Block-aligned lookup cannot express a boundary inside a cache
+            # block, so there is nothing finer to materialize than the block
+            # boundary the split already stops at.
+            return None
+        # ``num_prompt_tokens - 1``: the logits token is never reusable. The
+        # alignment is the one ``find_longest_cache_hit`` reports hits at, so
+        # this is exactly the candidate a consumer reaches before dropping.
+        boundary = (
+            round_down(request.num_prompt_tokens - 1, self._cache_hit_alignment_tokens)
+            - self._eagle_replay_drop_tokens
+        )
+        return boundary if boundary > 0 else None
+
     def _align_cacheable(self, num_tokens: int) -> int:
         """Largest prefix of ``num_tokens`` a future cache hit could match.
 
@@ -726,6 +796,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         cached_num_computed_tokens = self._align_cacheable(num_computed_tokens)
+        replay_boundary = self.eagle_replay_boundary(request)
         for manager in self.single_type_managers:
             num_tokens_to_cache = cached_num_computed_tokens
             # EAGLE groups match one block past each aligned boundary and drop
@@ -744,14 +815,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     num_finalized_computed_tokens,
                     cached_num_finalized_computed_tokens + manager.block_size,
                 )
-            # The manager already knows the fine hit granularity
-            # (``scheduler_block_size``); retention is passed separately so it
-            # can keep both the coarse segment tails and the fine replay
-            # boundary (which needs the fine value).
             manager.cache_blocks(
                 request,
                 num_tokens_to_cache,
                 retention_interval=self.retention_interval,
+                replay_boundary=replay_boundary,
             )
 
     def find_longest_cache_hit(
@@ -825,15 +893,10 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 # mamba: its finder never drops (draft models have no mamba
                 # layers), so the hit would grow past the candidate.
                 if drop_eagle_block and not isinstance(spec, MambaSpec):
-                    eagle_margin = (
-                        self.hash_block_size
-                        if self.enable_partial_hash_hits
-                        and manager_cls.supports_fine_grained_hash_lookup
-                        and group_block_size > self.hash_block_size
-                        else group_block_size
-                    )
                     _max_length = min(
-                        curr_hit_length + eagle_margin, max_cache_hit_length
+                        curr_hit_length
+                        + self._eagle_drop_unit(manager_cls, group_block_size),
+                        max_cache_hit_length,
                     )
                 hit_blocks, _new_hit_length = manager_cls.find_longest_cache_hit(
                     block_hashes=block_hashes,

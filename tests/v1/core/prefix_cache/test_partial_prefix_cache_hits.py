@@ -91,31 +91,50 @@ def make_full_mamba_manager(
     num_blocks: int = 32,
     use_eagle: bool = False,
     num_prefill_checkpoint_blocks: int = 0,
+    include_draft_eagle_group: bool = False,
+    retention_interval: int | None = None,
 ):
-    kv_cache_config = KVCacheConfig(
-        num_blocks=num_blocks,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
+    kv_cache_groups = [
+        KVCacheGroupSpec(
+            ["full"],
+            FullAttentionSpec(
+                block_size=full_block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["mamba"],
+            MambaSpec(
+                block_size=mamba_block_size,
+                shapes=(1, 1),
+                dtypes=(torch.float32,),
+                mamba_cache_mode="align",
+                num_prefill_checkpoint_blocks=num_prefill_checkpoint_blocks,
+            ),
+        ),
+    ]
+    if include_draft_eagle_group:
+        # A real drafter annotates only its own group, which leaves the mamba
+        # manager with ``use_eagle=False`` even though the model drops.
+        kv_cache_groups.append(
             KVCacheGroupSpec(
-                ["full"],
+                ["draft"],
                 FullAttentionSpec(
                     block_size=full_block_size,
                     num_kv_heads=1,
                     head_size=1,
                     dtype=torch.float32,
+                    non_causal=True,
                 ),
-            ),
-            KVCacheGroupSpec(
-                ["mamba"],
-                MambaSpec(
-                    block_size=mamba_block_size,
-                    shapes=(1, 1),
-                    dtypes=(torch.float32,),
-                    mamba_cache_mode="align",
-                    num_prefill_checkpoint_blocks=num_prefill_checkpoint_blocks,
-                ),
-            ),
-        ],
+                is_eagle_group=True,
+            )
+        )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=kv_cache_groups,
     )
     scheduler_block_size = lcm(
         full_block_size * dcp_world_size,
@@ -129,6 +148,265 @@ def make_full_mamba_manager(
         scheduler_block_size=scheduler_block_size,
         hash_block_size=hash_block_size,
         use_eagle=use_eagle,
+        retention_interval=retention_interval,
+    )
+
+
+@pytest.mark.parametrize("annotate_draft_group", [False, True])
+@pytest.mark.parametrize(
+    (
+        "dcp_world_size",
+        "hash_block_size",
+        "expected_boundary",
+        "expected_chunk_ends",
+    ),
+    [
+        # Non-DCP: ``scheduler_block_size`` equals the group block size, so
+        # retention alignment is unaffected by the fine-grained lowering. Kept
+        # as the non-regression side -- it must stay green either way.
+        (1, 128, 7424, [4608, 7424, 7621]),
+        # DCP: the virtual full-attention block pushes ``scheduler_block_size``
+        # above the hash size, which is what floors the reachable boundary away
+        # under sparse retention. This is the row that actually regresses.
+        (4, 1536, 4608, [4608, 7621]),
+    ],
+)
+def test_eagle_replay_boundary_is_materialized_and_reusable(
+    annotate_draft_group,
+    dcp_world_size,
+    hash_block_size,
+    expected_boundary,
+    expected_chunk_ends,
+):
+    """The Mamba checkpoint must land where the EAGLE drop leaves a consumer.
+
+    EAGLE/MTP drops one hash unit from the prompt's last hash boundary.
+    Registering only the prompt boundary publishes a state nothing can resume
+    from, and scheduler-aligned retention can discard the reachable DCP state.
+
+    Parametrized over draft-group annotation: it flips the Mamba manager's own
+    ``use_eagle`` flag while the model still drops, so a fix keyed off that
+    flag silently stops working in the annotated case.
+    """
+    block_size = 1536
+    prompt_len = 7621
+
+    manager = make_full_mamba_manager(
+        dcp_world_size=dcp_world_size,
+        hash_block_size=hash_block_size,
+        full_block_size=block_size,
+        mamba_block_size=block_size,
+        num_blocks=128,
+        use_eagle=True,
+        include_draft_eagle_group=annotate_draft_group,
+        retention_interval=0,
+    )
+    coordinator = manager.coordinator
+
+    token_ids = list(range(prompt_len))
+    producer = make_request("producer", token_ids, hash_block_size, sha256)
+    assert coordinator.eagle_replay_boundary(producer) == expected_boundary
+
+    scheduler = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=block_size),
+        max_num_scheduled_tokens=8192,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+        use_eagle=True,
+        hash_block_size=hash_block_size,
+        mamba_partial_cache_hit=True,
+        mamba_has_prefill_checkpoint_blocks=False,
+        eagle_replay_boundary=coordinator.eagle_replay_boundary,
+    )
+
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(producer)
+    assert num_computed == 0
+    chunk_ends: list[int] = []
+    while producer.num_computed_tokens < prompt_len:
+        num_new_tokens = Scheduler._mamba_block_aligned_split(
+            scheduler, producer, prompt_len - producer.num_computed_tokens
+        )
+        assert num_new_tokens > 0
+        assert (
+            manager.allocate_slots(
+                producer, num_new_tokens, num_computed, computed_blocks
+            )
+            is not None
+        )
+        producer.num_computed_tokens += num_new_tokens
+        chunk_ends.append(producer.num_computed_tokens)
+        computed_blocks = None
+        num_computed = 0
+        manager.new_step_starts()
+
+    # A rolling Mamba state is only written where a chunk ends, so the split
+    # has to stop on the boundary for it to exist at all.
+    assert chunk_ends == expected_chunk_ends
+
+    manager.free(producer)
+    manager.new_step_starts()
+
+    consumer = make_request("consumer", token_ids, hash_block_size, sha256)
+    _, num_computed, _ = manager.get_computed_blocks(consumer)
+    assert num_computed == expected_boundary
+
+
+def test_replay_boundary_retained_without_eagle_drop():
+    """Sparse retention must keep the plain replay boundary under DCP.
+
+    The EAGLE drop is not what makes the boundary unreachable: retention
+    aligns every reachable boundary, and ``num_prompt_tokens - 1`` is one of
+    them. With a DCP-scaled ``scheduler_block_size`` (6144) above the hash size
+    (1536), aligning retention to the scheduler block floors the prompt's own
+    boundary (7680) down to 6144 and discards the state a replaying request
+    lands on -- with no drafter anywhere in the model.
+    """
+    block_size = 1536
+    # 7681 - 1 == 7680 is hash-aligned but not scheduler-aligned (7680 % 6144
+    # == 1536), so the two alignments disagree about which state to keep.
+    prompt_len = 7681
+    expected_boundary = 7680
+
+    manager = make_full_mamba_manager(
+        dcp_world_size=4,
+        hash_block_size=block_size,
+        full_block_size=block_size,
+        mamba_block_size=block_size,
+        num_blocks=128,
+        use_eagle=False,
+        retention_interval=0,
+    )
+    coordinator = manager.coordinator
+    # No group drops, so there is no EAGLE boundary in play at all.
+    assert (
+        coordinator.eagle_replay_boundary(
+            make_request("probe", list(range(prompt_len)), block_size, sha256)
+        )
+        is None
+    )
+
+    token_ids = list(range(prompt_len))
+    producer = make_request("producer", token_ids, block_size, sha256)
+
+    scheduler = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=block_size),
+        max_num_scheduled_tokens=8192,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+        use_eagle=False,
+        hash_block_size=block_size,
+        mamba_partial_cache_hit=True,
+        mamba_has_prefill_checkpoint_blocks=False,
+        eagle_replay_boundary=coordinator.eagle_replay_boundary,
+    )
+
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(producer)
+    assert num_computed == 0
+    chunk_ends: list[int] = []
+    while producer.num_computed_tokens < prompt_len:
+        num_new_tokens = Scheduler._mamba_block_aligned_split(
+            scheduler, producer, prompt_len - producer.num_computed_tokens
+        )
+        assert num_new_tokens > 0
+        assert (
+            manager.allocate_slots(
+                producer, num_new_tokens, num_computed, computed_blocks
+            )
+            is not None
+        )
+        producer.num_computed_tokens += num_new_tokens
+        chunk_ends.append(producer.num_computed_tokens)
+        computed_blocks = None
+        num_computed = 0
+        manager.new_step_starts()
+
+    # The rolling state only exists where a chunk ended.
+    assert expected_boundary in chunk_ends
+    assert chunk_ends[-1] == prompt_len
+
+    manager.free(producer)
+    manager.new_step_starts()
+
+    consumer = make_request("consumer", token_ids, block_size, sha256)
+    _, num_computed, _ = manager.get_computed_blocks(consumer)
+    assert num_computed == expected_boundary
+
+
+def test_cache_hit_alignment_is_pushed_to_managers():
+    """Retention has to align to the granularity lookups actually report at.
+
+    ``find_longest_cache_hit`` uses ``_cache_hit_alignment_tokens``; if
+    ``cache_blocks`` keeps aligning to ``scheduler_block_size`` the producer
+    retains a position the consumer never asks for. Cover both branches, since
+    the disabled one is what keeps ``SlidingWindowManager.reachable_block_mask``
+    from asserting on an ``alignment_tokens`` finer than its block size.
+    """
+    block_size = 1536
+    manager = make_full_mamba_manager(
+        dcp_world_size=4,
+        hash_block_size=block_size,
+        full_block_size=block_size,
+        mamba_block_size=block_size,
+        num_blocks=128,
+    )
+    coordinator = manager.coordinator
+    assert coordinator.enable_partial_hash_hits
+    assert coordinator.scheduler_block_size > block_size
+    assert all(
+        single_type_manager.cache_hit_alignment_tokens == block_size
+        for single_type_manager in coordinator.single_type_managers
+    )
+
+    # A group that cannot do fine-grained lookup disables partial hash hits, so
+    # retention must stay on the coarse scheduler alignment.
+    hash_block_size = 2
+    sliding_window_block_size = 2 * hash_block_size
+    mamba_block_size = 2 * sliding_window_block_size
+    coarse = make_kv_cache_manager(
+        kv_cache_config=KVCacheConfig(
+            num_blocks=64,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["full"],
+                    FullAttentionSpec(
+                        block_size=hash_block_size,
+                        num_kv_heads=1,
+                        head_size=1,
+                        dtype=torch.float32,
+                    ),
+                ),
+                KVCacheGroupSpec(
+                    ["mamba"],
+                    MambaSpec(
+                        block_size=mamba_block_size,
+                        shapes=(1, 1),
+                        dtypes=(torch.float32,),
+                        mamba_cache_mode="align",
+                    ),
+                ),
+                KVCacheGroupSpec(
+                    ["swa_draft"],
+                    SlidingWindowSpec(
+                        block_size=sliding_window_block_size,
+                        num_kv_heads=1,
+                        head_size=1,
+                        dtype=torch.float32,
+                        sliding_window=sliding_window_block_size,
+                    ),
+                    is_eagle_group=True,
+                ),
+            ],
+        ),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        use_eagle=True,
+    )
+    coarse_coordinator = coarse.coordinator
+    assert not coarse_coordinator.enable_partial_hash_hits
+    assert all(
+        single_type_manager.cache_hit_alignment_tokens
+        == coarse_coordinator.scheduler_block_size
+        for single_type_manager in coarse_coordinator.single_type_managers
     )
 
 
@@ -151,6 +429,7 @@ def test_mamba_align_split_partial_tail_schedule(dcp_world_size: int):
         scheduler_block_size=scheduler_block_size,
         mamba_partial_cache_hit=True,
         mamba_has_prefill_checkpoint_blocks=False,
+        eagle_replay_boundary=lambda request: None,
     )
     split = Scheduler._mamba_block_aligned_split
 

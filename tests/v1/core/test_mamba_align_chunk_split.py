@@ -82,6 +82,7 @@ def _split(
     use_eagle: bool = True,
     partial_hit: bool = False,
     num_prefill_checkpoint_blocks: int = 0,
+    eagle_replay_boundary: int | None = None,
 ) -> int:
     """Call the real `Scheduler._mamba_block_aligned_split` on a stub self."""
     stub = SimpleNamespace(
@@ -95,6 +96,7 @@ def _split(
         mamba_has_prefill_checkpoint_blocks=(
             num_prefill_checkpoint_blocks > 0 and not use_eagle
         ),
+        eagle_replay_boundary=lambda request: eagle_replay_boundary,
     )
     return Scheduler._mamba_block_aligned_split(stub, request, num_new_tokens)
 

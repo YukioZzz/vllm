@@ -344,6 +344,12 @@ class Scheduler(SchedulerInterface):
             and self.hash_block_size < self.block_size
             and self.kv_cache_manager.coordinator.enable_partial_hash_hits
         )
+        # Where a replaying request resumes once the EAGLE/MTP drop is applied.
+        # Bound from the coordinator so the prefill split materializes state at
+        # the same position the cache-hit path later looks it up at.
+        self.eagle_replay_boundary = (
+            self.kv_cache_manager.coordinator.eagle_replay_boundary
+        )
 
         # Counts of non-empty steps scheduled / processed. update_from_output
         # is called once per scheduled step in FIFO order, so these stay in sync.
@@ -438,11 +444,19 @@ class Scheduler(SchedulerInterface):
                 end = aligned_end
 
         next_block_boundary = (start // block_size + 1) * block_size
-        tail_boundary = (
-            request.num_prompt_tokens // self.hash_block_size * self.hash_block_size
-            if self.mamba_partial_cache_hit
-            else 0
-        )
+        tail_boundary = 0
+        if self.mamba_partial_cache_hit:
+            # Stop exactly where the partial tail will be registered. Under the
+            # EAGLE/MTP drop that is one drop unit below the prompt's last hash
+            # boundary, not the boundary itself.
+            replay_boundary = self.eagle_replay_boundary(request)
+            tail_boundary = (
+                replay_boundary
+                if replay_boundary is not None
+                else request.num_prompt_tokens
+                // self.hash_block_size
+                * self.hash_block_size
+            )
         stops = (
             # Same invariant: a chunk starting mid-block stops at the boundary
             # rather than running past it.
