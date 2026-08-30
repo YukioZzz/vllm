@@ -774,6 +774,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                     query_start_loc=attn_metadata.query_start_loc[
                         : attn_metadata.num_decodes + 1
                     ],
+                    skip_empty_shard_mask=attn_metadata.decode.no_empty_dcp_shards,
                 )
             self._v_up_proj(latent_out, out=attn_out[:num_mqa_tokens])
 

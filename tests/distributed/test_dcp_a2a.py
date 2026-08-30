@@ -469,6 +469,76 @@ class TestPackedA2AKernels:
         assert torch.isneginf(actual_lse[:1]).all()
         assert torch.isfinite(actual_output[1:]).all()
 
+    @pytest.mark.skipif(
+        torch.accelerator.device_count() < 1, reason="CUDA is required."
+    )
+    @pytest.mark.parametrize("num_seqs", [2, 17])
+    def test_skip_empty_shard_mask_leaves_lse_untouched(self, num_seqs: int):
+        """``skip_empty_shard_mask`` bypasses masking on both pack paths.
+
+        ``num_seqs <= 16`` masks inside the pack kernel, larger batches fall
+        back to the standalone masking kernel; neither may run when the caller
+        has already proven no shard is empty.
+        """
+        from vllm.v1.attention.ops.dcp import (
+            _dcp_a2a_lse_pack_dim,
+            _dcp_a2a_pack_send,
+            _dcp_a2a_unpack_combine,
+        )
+
+        device = torch.device("cuda")
+        world_size, h_per_rank, head_dim = 2, 1, 32
+        num_heads = world_size * h_per_rank
+        num_tokens = num_seqs
+        output = torch.randn(
+            num_tokens,
+            num_heads,
+            head_dim,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        lse = torch.randn(num_tokens, num_heads, device=device, dtype=output.dtype)
+        # First shard is empty; masking would drive its rows to -inf.
+        seq_lens = torch.ones(num_seqs, device=device, dtype=torch.int32)
+        seq_lens[0] = 0
+        query_start_loc = torch.arange(num_seqs + 1, device=device, dtype=torch.int32)
+        lse_pack_dim = _dcp_a2a_lse_pack_dim(output.dtype)
+        send_buffer = torch.empty(
+            (
+                world_size,
+                num_tokens,
+                h_per_rank,
+                head_dim + lse_pack_dim,
+            ),
+            device=device,
+            dtype=output.dtype,
+        )
+
+        _dcp_a2a_pack_send(
+            output,
+            lse,
+            send_buffer,
+            world_size,
+            h_per_rank,
+            head_dim,
+            lse_pack_dim,
+            seq_lens=seq_lens,
+            query_start_loc=query_start_loc,
+            skip_empty_shard_mask=True,
+        )
+        actual_output, actual_lse = _dcp_a2a_unpack_combine(
+            send_buffer,
+            head_dim,
+            lse_pack_dim,
+            return_lse=True,
+            is_lse_base_on_e=True,
+        )
+
+        assert torch.isfinite(actual_lse).all()
+        assert torch.isfinite(actual_output).all()
+        # The caller-supplied LSE must survive untouched.
+        assert not torch.isneginf(lse).any()
+
 
 def _distributed_packed_a2a_worker(env: dict[str, str]) -> None:
     update_environment_variables(env)
