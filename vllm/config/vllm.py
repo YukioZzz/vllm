@@ -2770,7 +2770,8 @@ class VllmConfig:
 
         if (
             self.kv_transfer_config is not None
-            and self.kv_transfer_config.kv_connector is not None
+            and self.kv_transfer_config.is_kv_transfer_instance
+            and not self._uses_only_simple_cpu_offload()
             and self.parallel_config.cp_kv_cache_interleave_size != local_block_size
         ):
             interleave = self.parallel_config.cp_kv_cache_interleave_size
@@ -2793,14 +2794,17 @@ class VllmConfig:
         """
         block_size = self.cache_config.block_size
 
-        # Skip DCP interleave-size compatibility when a KV connector is configured:
-        # cp_kv_cache_interleave_size is pinned to block_size for PD by each worker
-        pd_active = (
+        # PD connectors pin the interleave to block_size after KV-cache sizing.
+        # Local SimpleCPU offload keeps the configured interleave, so validate it.
+        block_aligned_transfer = (
             self.kv_transfer_config is not None
-            and self.kv_transfer_config.kv_connector is not None
             and self.kv_transfer_config.is_kv_transfer_instance
+            and not self._uses_only_simple_cpu_offload()
         )
-        if self.parallel_config.decode_context_parallel_size > 1 and not pd_active:
+        if (
+            self.parallel_config.decode_context_parallel_size > 1
+            and not block_aligned_transfer
+        ):
             assert (
                 self.parallel_config.cp_kv_cache_interleave_size <= block_size
                 and block_size % self.parallel_config.cp_kv_cache_interleave_size == 0
@@ -2816,6 +2820,21 @@ class VllmConfig:
                 "to schedule a multiple of block_size tokens even if they are "
                 "in the middle of a mm input"
             )
+
+    def _uses_only_simple_cpu_offload(self) -> bool:
+        """Whether every configured KV connector is local SimpleCPU offload."""
+        config = self.kv_transfer_config
+        if config is None:
+            return False
+        if config.kv_connector == "SimpleCPUOffloadConnector":
+            return True
+        if config.kv_connector != "MultiConnector":
+            return False
+        connectors = config.kv_connector_extra_config.get("connectors", [])
+        return bool(connectors) and all(
+            child.get("kv_connector") == "SimpleCPUOffloadConnector"
+            for child in connectors
+        )
 
     @model_validator(mode="after")
     def validate_nvfp4_kv_cache_with_mla(self) -> "VllmConfig":
