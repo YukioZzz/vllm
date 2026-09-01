@@ -2198,8 +2198,8 @@ def test_fine_grained_external_hits_require_eager_offload() -> None:
     assert not lazy.scheduler.cpu_coordinator.enable_partial_hash_hits
 
 
-def test_eager_store_revisits_mamba_blocks_once_hash_is_available() -> None:
-    """A hash gap must stop the cursor before later Mamba blocks."""
+def test_eager_store_retries_mamba_hash_gap_without_blocking_later_blocks() -> None:
+    """A Mamba hash gap is retried without blocking later snapshots."""
     block_size = 4 * BLOCK_SIZE
     fix = _make_hybrid_attention_mamba_scheduler(
         num_cpu_blocks=16, num_gpu_blocks=24, block_size=block_size
@@ -2217,8 +2217,8 @@ def test_eager_store_revisits_mamba_blocks_once_hash_is_available() -> None:
     req.num_computed_tokens = 0
     sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
 
-    # The first Mamba block has no hash yet. The cursor must stop there rather
-    # than store the second block and advance past the gap.
+    # The first Mamba block has no hash yet. The second block must still be
+    # stored while the first position remains pending for a later retry.
     meta1 = sched.build_connector_meta(
         make_scheduler_output(
             {req.request_id: 2 * block_size},
@@ -2226,11 +2226,17 @@ def test_eager_store_revisits_mamba_blocks_once_hash_is_available() -> None:
         )
     )
     assert meta1.store_event >= 0
-    assert meta1.store_gpu_blocks == [block.block_id for block in attn_blocks]
-    assert sched._reqs_to_store[req.request_id].num_stored_blocks == [2, 0]
+    assert meta1.store_gpu_blocks == [
+        *(block.block_id for block in attn_blocks),
+        gpu_blocks[1].block_id,
+    ]
+    state = sched._reqs_to_store[req.request_id]
+    assert state.next_scan_block_idx == [2, 2]
+    assert state.pending_mamba_block_indices == [set(), {0}]
     simulate_store_completion(sched, meta1.store_event)
 
-    # Once the gap becomes hashable, both contiguous Mamba blocks are visited.
+    # Once the gap becomes hashable, retry exactly that position. The later
+    # block was already stored and must not be scanned or copied again.
     gpu_blocks[0]._block_hash = make_block_hash_with_group_id(req.block_hashes[0], 1)
     req.num_computed_tokens = 2 * block_size
     meta2 = sched.build_connector_meta(
@@ -2240,4 +2246,6 @@ def test_eager_store_revisits_mamba_blocks_once_hash_is_available() -> None:
         )
     )
     assert meta2.store_event >= 0
-    assert meta2.store_gpu_blocks == [block.block_id for block in gpu_blocks]
+    assert meta2.store_gpu_blocks == [gpu_blocks[0].block_id]
+    assert state.next_scan_block_idx == [2, 2]
+    assert state.pending_mamba_block_indices == [set(), set()]

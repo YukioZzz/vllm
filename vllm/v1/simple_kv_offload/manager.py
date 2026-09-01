@@ -5,6 +5,7 @@
 import contextlib
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
+from itertools import chain
 from typing import TYPE_CHECKING, Any
 
 from vllm.config import VllmConfig
@@ -58,8 +59,12 @@ class StoreRequestState:
     request: "Request"
     # Accumulated block IDs from scheduler_output via yield_req_data.
     block_ids: tuple[list[int], ...]
-    # Per-group cursors tracking how many blocks have been stored/skipped.
-    num_stored_blocks: list[int]
+    # Per-group position of the next block that has never been scanned.
+    next_scan_block_idx: list[int]
+    # Mamba positions whose blocks did not have a hash when first scanned.
+    # They are retried independently so one sparse gap cannot block later
+    # cacheable states or shift a count-based cursor onto the wrong position.
+    pending_mamba_block_indices: list[set[int]]
     store_events: set[int] = field(default_factory=set)
     finished: bool = False
 
@@ -309,7 +314,8 @@ class SimpleCPUOffloadScheduler:
             self._reqs_to_store[req_id] = StoreRequestState(
                 request=request,
                 block_ids=tuple([] for _ in range(num_groups)),
-                num_stored_blocks=[0] * num_groups,
+                next_scan_block_idx=[0] * num_groups,
+                pending_mamba_block_indices=[set() for _ in range(num_groups)],
             )
 
         # Pop the CPU hit cached by get_num_new_matched_tokens(). The
@@ -592,7 +598,8 @@ class SimpleCPUOffloadScheduler:
             # Accumulate new block IDs.
             if preempted:
                 state.block_ids = tuple([] for _ in range(num_groups))
-                state.num_stored_blocks = [0] * num_groups
+                state.next_scan_block_idx = [0] * num_groups
+                state.pending_mamba_block_indices = [set() for _ in range(num_groups)]
             if new_block_id_groups:
                 for g in range(min(num_groups, len(new_block_id_groups))):
                     if new_block_id_groups[g] is not None:
@@ -609,7 +616,6 @@ class SimpleCPUOffloadScheduler:
             # --- Phase 1: Scan blocks, classify as cached vs to-store ---
             gpu_block_ids: list[int] = []
             block_hashes_to_store: list[bytes] = []
-            advanced_per_group: list[int] = [0] * num_groups
             out_of_space = False
             # Confirmed tokens: include tokens already computed in prior steps
             # and tokens scheduled in the current step. Current-step stores are
@@ -624,32 +630,33 @@ class SimpleCPUOffloadScheduler:
             aligned_tokens = confirmed_tokens // self.block_size * self.block_size
 
             for g in range(num_groups):
-                # FIXME (yifan): handle CPU cache eviction, where
-                # num_stored_blocks can be stale and omit evicted blocks in
-                # the middle of the request.
-                already_stored_g = state.num_stored_blocks[g]
                 group_gpu_ids = block_ids_by_group[g]
-
                 g_block_size = self.cpu_coordinator.single_type_managers[g].block_size
-                ready_blocks_g = aligned_tokens // g_block_size
-                scannable = group_gpu_ids[already_stored_g:ready_blocks_g]
+                ready_blocks_g = min(aligned_tokens // g_block_size, len(group_gpu_ids))
+                next_scan_g = state.next_scan_block_idx[g]
+                pending_g = state.pending_mamba_block_indices[g]
+                retry_indices = sorted(idx for idx in pending_g if idx < ready_blocks_g)
+                new_indices = range(next_scan_g, ready_blocks_g)
 
-                for gpu_block_id in scannable:
+                for block_idx in chain(retry_indices, new_indices):
+                    gpu_block_id = group_gpu_ids[block_idx]
                     gpu_block = gpu_block_pool.blocks[gpu_block_id]
                     if gpu_block.is_null:
-                        advanced_per_group[g] += 1
+                        pending_g.discard(block_idx)
+                        if block_idx >= next_scan_g:
+                            next_scan_g = block_idx + 1
                         continue
 
                     bhash_with_group = gpu_block.block_hash
                     if bhash_with_group is None:
                         # Masked-out SWA position the coordinator chose not to
                         # hash; it can never serve a prefix-cache hit, so skip.
-                        # Mamba align groups can populate the hash in a later
-                        # step once the boundary state is cached. Stop at the
-                        # first gap so the contiguous cursor can revisit it.
+                        # A Mamba align position may become hashable later, but
+                        # it must not head-of-line block subsequent snapshots.
                         if isinstance(kv_cache_groups[g].kv_cache_spec, MambaSpec):
-                            break
-                        advanced_per_group[g] += 1
+                            pending_g.add(block_idx)
+                        if block_idx >= next_scan_g:
+                            next_scan_g = block_idx + 1
                         continue
 
                     # Skip if already scheduled for store or already cached in CPU.
@@ -660,7 +667,9 @@ class SimpleCPUOffloadScheduler:
                         )
                         is not None
                     ):
-                        advanced_per_group[g] += 1
+                        pending_g.discard(block_idx)
+                        if block_idx >= next_scan_g:
+                            next_scan_g = block_idx + 1
                         continue
 
                     if num_free <= 0:
@@ -670,7 +679,11 @@ class SimpleCPUOffloadScheduler:
 
                     gpu_block_ids.append(gpu_block_id)
                     block_hashes_to_store.append(bhash_with_group)
-                    advanced_per_group[g] += 1
+                    pending_g.discard(block_idx)
+                    if block_idx >= next_scan_g:
+                        next_scan_g = block_idx + 1
+
+                state.next_scan_block_idx[g] = next_scan_g
 
                 if out_of_space:
                     break
@@ -702,10 +715,6 @@ class SimpleCPUOffloadScheduler:
                     len(cpu_block_ids),
                     num_groups,
                 )
-
-            # Advance per-group cursors (includes cached hits + newly stored)
-            for g in range(num_groups):
-                state.num_stored_blocks[g] += advanced_per_group[g]
 
         return merged_gpu_block_ids, merged_cpu_block_ids, req_ids
 
