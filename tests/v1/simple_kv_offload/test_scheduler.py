@@ -413,6 +413,41 @@ def test_eager_store_and_load_roundtrip() -> None:
     assert len(meta2.load_cpu_blocks) == len(meta2.load_gpu_blocks)
 
 
+def test_eager_store_includes_current_step_full_block() -> None:
+    """Store a block that is first completed in the current scheduler step."""
+    fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=16, lazy=False)
+    sched = fix.scheduler
+
+    req = make_request(num_blocks=1)
+    kv_blocks = _alloc_and_register(fix, req, num_blocks=1, confirmed=False)
+    assert req.num_computed_tokens == 0
+    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
+
+    meta = sched.build_connector_meta(
+        make_scheduler_output(
+            {req.request_id: BLOCK_SIZE},
+            new_reqs={req.request_id: kv_blocks.get_block_ids()},
+        )
+    )
+
+    assert meta.store_event >= 0
+    assert meta.store_gpu_blocks == [kv_blocks.get_block_ids()[0][0]]
+    assert len(meta.store_cpu_blocks) == 1
+    simulate_store_completion(sched, meta.store_event)
+
+    req2 = Request(
+        request_id="req-current-step-store-hit",
+        prompt_token_ids=req.prompt_token_ids,
+        sampling_params=req.sampling_params,
+        pooling_params=None,
+        mm_features=None,
+        block_hasher=req._block_hasher,
+    )
+    hit_tokens, is_async = sched.get_num_new_matched_tokens(req2, num_computed_tokens=0)
+    assert hit_tokens == BLOCK_SIZE
+    assert is_async is True
+
+
 # ---------------------------------------------------------------------------
 # Test 1b: Boundary — max_hit_len cap drops the last full block when the
 # prompt is an exact multiple of BLOCK_SIZE.
@@ -1760,7 +1795,9 @@ def test_cp_effective_block_size_store_and_load(
     req = _make_cp_request(num_blocks=2, virtual_block_size=vbs)
     gpu_blocks = _allocate_cp_gpu_blocks(gpu_pool, req, 2, vbs)
     kv = KVCacheBlocks(blocks=(gpu_blocks,))
-    req.num_computed_tokens = vbs
+    # build_connector_meta runs before the scheduled tokens are committed to
+    # the request, so only num_scheduled_tokens contributes on this step.
+    req.num_computed_tokens = 0
     sched.update_state_after_alloc(req, kv, num_external_tokens=0)
     m1 = sched.build_connector_meta(
         make_scheduler_output(
@@ -1775,7 +1812,7 @@ def test_cp_effective_block_size_store_and_load(
     # Load one DCP-scaled logical block from a two-block CPU hit.
     req2 = _make_cp_request(num_blocks=2, virtual_block_size=vbs)
     kv2 = KVCacheBlocks(blocks=(_allocate_cp_gpu_blocks(gpu_pool, req2, 2, vbs),))
-    req2.num_computed_tokens = 2 * vbs
+    req2.num_computed_tokens = 0
     sched.update_state_after_alloc(req2, kv2, num_external_tokens=0)
     m2 = sched.build_connector_meta(
         make_scheduler_output(
@@ -1885,6 +1922,8 @@ def test_dcp_mixed_attention_mamba_store_and_load_geometry() -> None:
         hash_block_size=hash_block_size,
     )
     assert not sched.cpu_coordinator.enable_partial_hash_hits
+    assert sched.group_block_sizes == (hash_block_size, mamba_block_size)
+    assert sched.fa_block_size == hash_block_size
     gpu_pool = BlockPool(
         num_gpu_blocks=num_gpu_blocks,
         enable_caching=True,

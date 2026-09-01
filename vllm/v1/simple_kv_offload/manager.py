@@ -105,15 +105,6 @@ class SimpleCPUOffloadScheduler:
                 self.fa_gidx = g_idx
                 break
         assert 0 <= self.fa_gidx < len(self.cpu_kv_cache_config.kv_cache_groups)
-        # FA group's own block_size; divides scheduler_block_size (the LCM)
-        # but is NOT assumed to equal it.
-        self.fa_block_size: int = (
-            self.cpu_kv_cache_config.kv_cache_groups[
-                self.fa_gidx
-            ].kv_cache_spec.block_size
-            * self.cp_world_size
-        )
-        assert self.block_size % self.fa_block_size == 0
 
         logger.info(
             "SimpleCPUOffloadScheduler: Allocating %d offload blocks "
@@ -139,6 +130,11 @@ class SimpleCPUOffloadScheduler:
             hash_block_size=self.hash_block_size,
             allow_partial_hash_hits=False,
         )
+        self.group_block_sizes = self.cpu_coordinator.group_block_sizes
+        # FA group's own resolved block_size; divides scheduler_block_size
+        # (the LCM) but is NOT assumed to equal it.
+        self.fa_block_size: int = self.group_block_sizes[self.fa_gidx]
+        assert self.block_size % self.fa_block_size == 0
         self.cpu_block_pool: BlockPool = self.cpu_coordinator.block_pool
         # GPU block pool reference - bound after scheduler builds kv_cache_manager
         self._gpu_block_pool: BlockPool | None = None
@@ -351,7 +347,7 @@ class SimpleCPUOffloadScheduler:
         # the rest will be released along with the temp pin below.
         cpu_hit_blocks: list[list[KVCacheBlock]] = []
         for g in range(num_groups):
-            g_block_size = self.cpu_coordinator.single_type_managers[g].block_size
+            g_block_size = self.group_block_sizes[g]
             assert num_external_tokens % g_block_size == 0, (
                 f"num_external_tokens={num_external_tokens} not aligned to "
                 f"group {g} block_size={g_block_size}"
@@ -370,7 +366,7 @@ class SimpleCPUOffloadScheduler:
                 continue
 
             # Number of blocks in the computed range for this group.
-            g_block_size = self.cpu_coordinator.single_type_managers[g].block_size
+            g_block_size = self.group_block_sizes[g]
             n_computed_g = cdiv(total_computed_tokens, g_block_size)
 
             # Back-trace: ext blocks sit at the tail of the computed range.
@@ -525,9 +521,8 @@ class SimpleCPUOffloadScheduler:
         """Identify newly computed blocks to offload from scheduler requests.
 
         Only considers blocks whose KV data has been **confirmed computed** by
-        the GPU. This means blocks from the current step are NOT stored until the
-        next step. If a request finishes in the same step as its last full block,
-        that block may be missed. (TODO: flush on finish.)
+        the GPU. Blocks scheduled in the current step can be stored here because
+        the worker orders the DMA read after the compute-done event.
 
         Returns:
             (gpu_block_ids, cpu_block_ids, req_ids) for the store event.
@@ -574,9 +569,15 @@ class SimpleCPUOffloadScheduler:
             block_hashes_to_store: list[bytes] = []
             advanced_per_group: list[int] = [0] * num_groups
             out_of_space = False
-            # Confirmed tokens: KV data written and visible to all streams.
+            # Confirmed tokens: include tokens already computed in prior steps
+            # and tokens scheduled in the current step. Current-step stores are
+            # ordered after a compute-done event in the worker, so their KV is
+            # visible before DMA reads begin.
             req = state.request
-            confirmed_tokens = req.num_computed_tokens - req.num_output_placeholders
+            confirmed_tokens = (
+                req.num_computed_tokens + num_new_tokens - req.num_output_placeholders
+            )
+            confirmed_tokens = max(0, min(confirmed_tokens, req.num_tokens))
             # Cap to blocks with confirmed KV data.
             aligned_tokens = confirmed_tokens // self.block_size * self.block_size
 
@@ -587,7 +588,7 @@ class SimpleCPUOffloadScheduler:
                 already_stored_g = state.num_stored_blocks[g]
                 group_gpu_ids = block_ids_by_group[g]
 
-                g_block_size = self.cpu_coordinator.single_type_managers[g].block_size
+                g_block_size = self.group_block_sizes[g]
                 ready_blocks_g = aligned_tokens // g_block_size
                 scannable = group_gpu_ids[already_stored_g:ready_blocks_g]
 
