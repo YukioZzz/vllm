@@ -41,6 +41,7 @@ class SingleTypeKVCacheManager(ABC):
     """
 
     supports_fine_grained_hash_lookup: ClassVar[bool] = False
+    has_positionally_stable_blocks: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -1370,6 +1371,10 @@ class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
 
 class MambaManager(SingleTypeKVCacheManager):
     supports_fine_grained_hash_lookup: ClassVar[bool] = True
+    # Align-mode state blocks can be nulled, freed, or relocated in place.
+    # Connectors must consume exact same-step handoffs instead of retaining
+    # positional snapshots of the request block table.
+    has_positionally_stable_blocks: ClassVar[bool] = False
 
     def __init__(
         self, kv_cache_spec: MambaSpec, block_pool: BlockPool, **kwargs

@@ -542,6 +542,40 @@ class SimpleCPUOffloadScheduler:
         # Dedup against blocks already scheduled.
         in_flight = self._in_flight_store_gpu_blocks
 
+        # Mamba align state blocks are not positionally stable. Consume exact
+        # same-step handoffs, but keep the coarse baseline scheduler-aligned.
+        block_state = scheduler_output.kv_connector_block_state
+        boundary_offloads = (
+            block_state.boundary_state_offloads if block_state is not None else {}
+        )
+        for req_id, entries in boundary_offloads.items():
+            scheduled_for_req = False
+            for _, gpu_block_id, boundary_tokens in entries:
+                if boundary_tokens % self.block_size != 0:
+                    continue
+                gpu_block = gpu_block_pool.blocks[gpu_block_id]
+                block_hash = gpu_block.block_hash
+                if (
+                    block_hash is None
+                    or gpu_block_id in in_flight
+                    or cpu_block_pool.cached_block_hash_to_block.get_one_block(
+                        block_hash
+                    )
+                    is not None
+                    or num_free <= 0
+                ):
+                    continue
+                cpu_block = cpu_block_pool.get_new_blocks(1)[0]
+                cpu_block._block_hash = block_hash
+                merged_gpu_block_ids.append(gpu_block_id)
+                merged_cpu_block_ids.append(cpu_block.block_id)
+                in_flight.add(gpu_block_id)
+                gpu_block_pool.touch([gpu_block])
+                num_free -= 1
+                scheduled_for_req = True
+            if scheduled_for_req:
+                req_ids.append(req_id)
+
         for req_id, new_block_id_groups, preempted in yield_req_data(scheduler_output):
             state = self._reqs_to_store.get(req_id)
             if state is None or state.finished:
@@ -582,6 +616,12 @@ class SimpleCPUOffloadScheduler:
             aligned_tokens = confirmed_tokens // self.block_size * self.block_size
 
             for g in range(num_groups):
+                group_manager = self.cpu_coordinator.single_type_managers[g]
+                # Unstable block tables are stored only from exact handoffs
+                # above; historical block IDs are not safe DMA sources.
+                if not group_manager.has_positionally_stable_blocks:
+                    continue
+
                 # FIXME (yifan): handle CPU cache eviction, where
                 # num_stored_blocks can be stale and omit evicted blocks in
                 # the middle of the request.
