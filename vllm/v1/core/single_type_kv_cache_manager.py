@@ -6,6 +6,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from typing import ClassVar
 
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
@@ -32,6 +33,8 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -119,13 +122,8 @@ class SingleTypeKVCacheManager(ABC):
         # managers (full attention, mamba "align"); harmlessly empty elsewhere.
         self._partial_hit_reqs: dict[str, tuple[int, KVCacheBlock]] = {}
         self._pending_cow_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
-        # Boundary-state offload hand-off for external KV connectors. A mamba
-        # "align" block table is not append-only (interior states are
-        # nulled/freed and speculative blocks relocate in place), so a
-        # connector cannot resolve its state blocks positionally. Record
-        # (request, group, block, exact token boundary) for each committed
-        # boundary state so a connector can offload the right block under the
-        # right hash. Populated only by mamba "align".
+        # Boundary-state offload hand-off for external KV connectors. Both
+        # Mamba align and fine-grained full attention publish exact block IDs.
         self._pending_boundary_state_offloads: list[
             tuple[str, int, KVCacheBlock, int]
         ] = []
@@ -400,9 +398,10 @@ class SingleTypeKVCacheManager(ABC):
 
         Entries are ``(req_id, group_id, block, boundary_tokens)``.
 
-        Only mamba "align" populates this. The blocks are not kept alive by
-        the request block table for the whole request, so a caller that reads
-        them asynchronously must pin them first.
+        Mamba "align" and DCP full-attention producers can populate this.
+        The blocks are not guaranteed to stay reachable via request block
+        tables for the whole request lifetime, so asynchronous callers must pin
+        before reading.
         """
         pending = self._pending_boundary_state_offloads
         self._pending_boundary_state_offloads = []
@@ -529,6 +528,11 @@ class SingleTypeKVCacheManager(ABC):
         req_blocks = self.req_to_blocks.pop(request_id, [])
         self.num_cached_block.pop(request_id, None)
         self._partial_hit_reqs.pop(request_id, None)
+        self._pending_boundary_state_offloads = [
+            entry
+            for entry in self._pending_boundary_state_offloads
+            if entry[0] != request_id
+        ]
         return req_blocks
 
     def free(self, request_id: str) -> None:
@@ -698,6 +702,12 @@ class SingleTypeKVCacheManager(ABC):
 class FullAttentionManager(SingleTypeKVCacheManager):
     supports_fine_grained_hash_lookup: ClassVar[bool] = True
 
+    def __init__(self, kv_cache_spec: FullAttentionSpec, **kwargs) -> None:
+        super().__init__(kv_cache_spec, **kwargs)
+        # The handoff queue is drained every step, so retain the last boundary
+        # offered by each producer until the request is released.
+        self._producer_partial_tail_reqs: dict[str, int] = {}
+
     @classmethod
     def find_longest_cache_hit(
         cls,
@@ -830,13 +840,34 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         block_idx = boundary_tokens // self.block_size
         if block_idx >= len(blocks):
             return
-        self.block_pool.cache_partial_block(
+        partial_hash = self.block_pool.cache_partial_block(
             request=request,
             block=blocks[block_idx],
             num_tokens=boundary_tokens,
             kv_cache_group_id=self.kv_cache_group_id,
             block_size=self.block_size,
         )
+        if (
+            partial_hash is not None
+            and self.cache_hit_alignment_tokens < self.block_size
+            and self._producer_partial_tail_reqs.get(request.request_id)
+            != boundary_tokens
+        ):
+            # Unlike Mamba align mode, full-attention KV is append-only inside
+            # the block, so the request block itself is a durable DMA source.
+            self._producer_partial_tail_reqs[request.request_id] = boundary_tokens
+            self._pending_boundary_state_offloads.append(
+                (
+                    request.request_id,
+                    self.kv_cache_group_id,
+                    blocks[block_idx],
+                    boundary_tokens,
+                )
+            )
+
+    def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
+        self._producer_partial_tail_reqs.pop(request_id, None)
+        return super().pop_blocks_for_free(request_id)
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         blocks = self.req_to_blocks[running_request_id]

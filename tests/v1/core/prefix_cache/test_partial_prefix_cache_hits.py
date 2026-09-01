@@ -657,7 +657,8 @@ def test_external_mamba_hit_same_block_uses_running_cow_on_continue():
     assert moved[0].block_id == cow_copy.dst_block_id
 
 
-def test_boundary_state_offloads_returns_cow_target():
+@pytest.mark.parametrize("dcp_world_size", [1, 2])
+def test_boundary_state_offloads_returns_cow_target(dcp_world_size: int):
     """Boundary hand-offs expose aligned snapshots and the partial-tail CoW
     target, never the overwritten CoW source."""
     hash_block_size = 2
@@ -691,6 +692,8 @@ def test_boundary_state_offloads_returns_cow_target():
         kv_cache_config=kv_cache_config,
         max_model_len=8192,
         enable_caching=True,
+        dcp_world_size=dcp_world_size,
+        scheduler_block_size=block_size,
         hash_block_size=hash_block_size,
     )
 
@@ -698,10 +701,11 @@ def test_boundary_state_offloads_returns_cow_target():
     computed_blocks, num_computed, _ = manager.get_computed_blocks(req0)
     assert manager.allocate_slots(req0, 6, num_computed, computed_blocks) is not None
 
-    # Step A offers the materialized aligned checkpoint immediately.
-    ((group_id, block_id, boundary_tokens),) = drain_boundary_state_offloads(manager)[
-        "0"
-    ]
+    # Step A offers the materialized Mamba checkpoint. Full attention only has
+    # a partial physical block under DCP for this particular geometry.
+    step_a_offloads = drain_boundary_state_offloads(manager)["0"]
+    mamba_offloads = [entry for entry in step_a_offloads if entry[0] == 1]
+    ((group_id, block_id, boundary_tokens),) = mamba_offloads
     assert group_id == 1
     assert boundary_tokens == 4
     aligned_hash = req0.block_hashes[4 // hash_block_size - 1]
@@ -710,6 +714,18 @@ def test_boundary_state_offloads_returns_cow_target():
     )
     assert aligned_block is not None
     assert block_id == aligned_block[0].block_id
+    full_offloads = [entry for entry in step_a_offloads if entry[0] == 0]
+    if dcp_world_size > 1:
+        ((_, full_block_id, full_boundary_tokens),) = full_offloads
+        assert full_boundary_tokens == 6
+        partial_full_hash = req0.block_hashes[6 // hash_block_size - 1]
+        partial_full_block = manager.block_pool.get_cached_block(
+            partial_full_hash, kv_cache_group_ids=[0]
+        )
+        assert partial_full_block is not None
+        assert full_block_id == partial_full_block[0].block_id
+    else:
+        assert full_offloads == []
 
     partial_mamba_hash = req0.block_hashes[6 // hash_block_size - 1]
     source_block = manager.block_pool.get_cached_block(
@@ -741,7 +757,52 @@ def test_boundary_state_offloads_returns_cow_target():
     assert manager.finalize_partial_tail_offloads(req0) == []
 
     manager.block_pool.free_blocks(retained)
+    full_manager = manager.coordinator.single_type_managers[0]
+    expected_boundaries = {"0": 6} if dcp_world_size > 1 else {}
+    assert full_manager._producer_partial_tail_reqs == expected_boundaries
     manager.free(req0)
+    assert full_manager._producer_partial_tail_reqs == {}
+
+
+def test_full_attention_handoff_requires_fine_alignment_under_dcp():
+    """DCP alone must not publish a boundary no connector can consume."""
+    hash_block_size = 2
+    manager = make_full_mamba_manager(
+        dcp_world_size=2,
+        hash_block_size=hash_block_size,
+        full_block_size=hash_block_size,
+        mamba_block_size=2 * hash_block_size,
+    )
+    full_manager = manager.coordinator.single_type_managers[0]
+    full_manager.cache_hit_alignment_tokens = full_manager.block_size
+
+    request = make_request("coarse", [0, 0, 1, 1, 2, 2], hash_block_size, sha256)
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(request)
+    assert manager.allocate_slots(request, 6, num_computed, computed_blocks) is not None
+
+    offloads = drain_boundary_state_offloads(manager).get(request.request_id, [])
+    assert all(group_id != 0 for group_id, _, _ in offloads)
+
+
+def test_full_attention_handoff_uses_fine_alignment_without_dcp():
+    """Fine alignment is sufficient when the physical block has a tail."""
+    hash_block_size = 2
+    manager = make_full_mamba_manager(
+        dcp_world_size=1,
+        hash_block_size=hash_block_size,
+        full_block_size=2 * hash_block_size,
+        mamba_block_size=2 * hash_block_size,
+        num_prefill_checkpoint_blocks=1,
+    )
+
+    request = make_request("fine", [0, 0, 1, 1, 2, 2], hash_block_size, sha256)
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(request)
+    assert manager.allocate_slots(request, 6, num_computed, computed_blocks) is not None
+
+    offloads = drain_boundary_state_offloads(manager)[request.request_id]
+    full_offloads = [entry for entry in offloads if entry[0] == 0]
+    assert len(full_offloads) == 1
+    assert full_offloads[0][2] == 6
 
 
 def test_finished_partial_tail_uses_table_source_once():
