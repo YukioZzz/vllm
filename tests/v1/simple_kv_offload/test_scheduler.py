@@ -1922,6 +1922,8 @@ def test_dcp_mixed_attention_mamba_store_and_load_geometry() -> None:
         hash_block_size=hash_block_size,
     )
     assert not sched.cpu_coordinator.enable_partial_hash_hits
+    assert sched.group_block_sizes == (hash_block_size, mamba_block_size)
+    assert sched.fa_block_size == hash_block_size
     gpu_pool = BlockPool(
         num_gpu_blocks=num_gpu_blocks,
         enable_caching=True,
