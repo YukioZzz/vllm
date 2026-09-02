@@ -16,6 +16,11 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.distributed.kv_transfer import (
+    get_kv_transfer_group,
+    has_kv_transfer_group,
+    is_v1_kv_transfer_group,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -646,6 +651,11 @@ class DFlashQwen3Model(nn.Module):
         # --- Per-layer cache insert ---
         all_k_final = all_k_flat.view(L, num_ctx, nkv, hd)
         per_layer = isinstance(context_slot_mapping, (list, tuple))
+        kv_connector = None
+        if has_kv_transfer_group() and is_v1_kv_transfer_group():
+            connector = get_kv_transfer_group()
+            if connector.has_connector_metadata():
+                kv_connector = connector
         for i in range(L):
             slot_mapping = (
                 context_slot_mapping[i] if per_layer else context_slot_mapping
@@ -661,6 +671,13 @@ class DFlashQwen3Model(nn.Module):
                 kv_cache,
                 slot_mapping,
             )
+            if kv_connector is not None:
+                kv_connector.save_kv_layer(
+                    attn.layer_name,
+                    kv_cache,
+                    None,
+                    num_prompt_tokens=num_ctx,
+                )
 
     def forward(
         self,
