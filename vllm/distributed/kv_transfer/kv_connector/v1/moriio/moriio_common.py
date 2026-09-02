@@ -43,6 +43,53 @@ ReqId = str
 TransferId = str
 TransferOffsetsKey = tuple[str, tuple[int, ...], tuple[int, ...], torch.dtype]
 
+MORIIO_GROUPED_BLOCK_IDS = "__moriio_grouped_block_ids_v1__"
+
+
+def pack_attn_mamba_block_ids(
+    attn_groups: "list[list[int]]",
+    mamba_block_ids: "list[int] | None" = None,
+) -> "list":
+    """Pack block ids for the MoRIIO block-id channel.
+
+    The legacy format is either ``attn`` or ``[attn, mamba]`` where ``attn`` is
+    already flattened across all attention groups. That is ambiguous once a
+    speculative drafter adds its own attention KV group, so the new grouped
+    format is ``[marker, attn_groups, mamba]``. Single-attention-group requests
+    keep the old representation for compatibility.
+    """
+    mamba = list(mamba_block_ids or [])
+    groups = [list(g) for g in attn_groups]
+    if len(groups) > 1:
+        return [MORIIO_GROUPED_BLOCK_IDS, groups, mamba]
+    attn = groups[0] if groups else []
+    return [attn, mamba] if mamba else attn
+
+
+def is_grouped_block_ids(block_ids: Any) -> bool:
+    return (
+        isinstance(block_ids, (list, tuple))
+        and len(block_ids) >= 2
+        and block_ids[0] == MORIIO_GROUPED_BLOCK_IDS
+    )
+
+
+def as_attn_groups_mamba(
+    block_ids: "list[int] | tuple | list | None",
+) -> "tuple[list[list[int]], list[int]]":
+    """Unpack carried block ids into grouped attention ids plus mamba ids."""
+    if not block_ids:
+        return [[]], []
+    if is_grouped_block_ids(block_ids):
+        attn_groups = [list(g) for g in block_ids[1]]
+        mamba = list(block_ids[2]) if len(block_ids) > 2 else []
+        return attn_groups, mamba
+    if isinstance(block_ids[0], (list, tuple)):
+        attn = list(block_ids[0])
+        mamba = list(block_ids[1]) if len(block_ids) > 1 else []
+        return [attn], mamba
+    return [list(block_ids)], []
+
 
 class MoRIIOTransferAck(NamedTuple):
     transfer_id: TransferId
@@ -62,13 +109,8 @@ def as_attn_mamba(
     ``(that_list, [])``. Consumers on the worker/engine side split at the
     point of use rather than threading a parallel mamba field through.
     """
-    if not block_ids:
-        return [], []
-    if isinstance(block_ids[0], (list, tuple)):
-        attn = list(block_ids[0])
-        mamba = list(block_ids[1]) if len(block_ids) > 1 else []
-        return attn, mamba
-    return list(block_ids), []
+    attn_groups, mamba = as_attn_groups_mamba(block_ids)
+    return [bid for group in attn_groups for bid in group], mamba
 
 
 @dataclass
@@ -76,8 +118,8 @@ class WriteTask:
     request_id: ReqId
     transfer_id: TransferId
     dst_engine_id: str
-    local_block_ids: list[int]
-    remote_block_ids_hint: list[int] | None
+    local_block_ids: list
+    remote_block_ids_hint: list | None
     layer_name: str
     event: torch.cuda.Event
     remote_notify_port: int
@@ -498,8 +540,8 @@ class ReqMeta:
     """Metadata for a single request."""
 
     transfer_id: TransferId
-    local_block_ids: list[int]
-    remote_block_ids: list[int]
+    local_block_ids: list
+    remote_block_ids: list
     remote_host: str
     remote_port: int
     remote_handshake_port: int

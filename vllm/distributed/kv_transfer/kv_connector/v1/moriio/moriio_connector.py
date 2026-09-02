@@ -41,12 +41,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     TransferError,
     TransferId,
     WriteTask,
-    as_attn_mamba,
+    as_attn_groups_mamba,
     fold_local_rank,
     get_moriio_mode,
     get_peer_zmq_from_request_id,
     get_port_offset,
     get_role,
+    pack_attn_mamba_block_ids,
     parse_moriio_zmq_address,
     pod_index,
     resolve_host_ip,
@@ -320,9 +321,10 @@ class MoRIIOConnector(KVConnectorBase_V1, SupportsHMA):
         kv_transfer_params so the decoder can pull/receive the KDA state.
         """
         assert self.connector_scheduler is not None
-        attn_block_ids, mamba_block_ids = self.connector_scheduler.split_block_groups(
-            block_ids
+        attn_groups, mamba_block_ids = (
+            self.connector_scheduler.split_block_groups_grouped(block_ids)
         )
+        attn_block_ids = [bid for group in attn_groups for bid in group]
         # Drive the completion path with the attention blocks, but carry the
         # mamba/KDA recurrent-state slot in the SAME remote_block_ids channel
         # (as [attn, mamba]) rather than a separate wire field, so the
@@ -330,8 +332,10 @@ class MoRIIOConnector(KVConnectorBase_V1, SupportsHMA):
         delay_free, params = self.connector_scheduler.request_finished(
             request, attn_block_ids, mamba_block_ids
         )
-        if params is not None and mamba_block_ids:
-            params["remote_block_ids"] = [attn_block_ids, mamba_block_ids]
+        if params is not None and (mamba_block_ids or len(attn_groups) > 1):
+            params["remote_block_ids"] = pack_attn_mamba_block_ids(
+                attn_groups, mamba_block_ids
+            )
         return delay_free, params
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
@@ -481,6 +485,12 @@ class MoRIIOConnectorScheduler:
         self._ssm_state_slots_are_positional = (
             vllm_config.cache_config.mamba_cache_mode == "all"
         )
+        self._layer_to_attn_group_pos: dict[str, int] = {}
+        if kv_cache_config is not None:
+            for pos, group_idx in enumerate(self._attn_group_ids):
+                group = kv_cache_config.kv_cache_groups[group_idx]
+                for layer_name in group.layer_names:
+                    self._layer_to_attn_group_pos[layer_name] = pos
 
         assert vllm_config.kv_transfer_config is not None, (
             "kv_transfer_config must be set for MoRIIOConnector"
@@ -813,13 +823,11 @@ class MoRIIOConnectorScheduler:
         request_id = request.request_id
         self.map_request_id(request_id, transfer_id)
         if params.get("do_remote_decode"):
-            attn_block_ids, mamba_block_ids = self.split_block_groups(
-                blocks.get_block_ids()
-            )
+            local_block_ids = self.pack_block_groups(blocks.get_block_ids())
             # Carry attn + mamba together in the single block-ids channel.
             self._reqs_need_save[request.request_id] = (
                 request,
-                [attn_block_ids, mamba_block_ids],
+                local_block_ids,
             )
             # Snapshot params now so chunked-prefill build_connector_meta
             # can recover them on the final chunk even if the live
@@ -834,14 +842,29 @@ class MoRIIOConnectorScheduler:
                     if "remote_engine_id" in params:
                         # remote_block_ids carries [attn, mamba] (hybrid) or a
                         # flat attn list; compare/trim on the attention half.
-                        remote_attn, _ = as_attn_mamba(remote_block_ids)
+                        remote_attn_groups, _ = as_attn_groups_mamba(remote_block_ids)
+                        remote_attn = [
+                            bid for group in remote_attn_groups for bid in group
+                        ]
                         if num_external_tokens > 0:
                             # Get unhashed blocks to pull from remote.
-                            attn_block_ids, mamba_block_ids = self.split_block_groups(
-                                blocks.get_block_ids()
+                            local_attn_groups, mamba_block_ids = (
+                                self.split_block_groups_grouped(blocks.get_block_ids())
                             )
-                            local_attn = attn_block_ids
-                            if len(local_attn) > len(remote_attn):
+                            if len(local_attn_groups) == len(remote_attn_groups):
+                                reconciled_attn_groups = []
+                                for local_attn, remote_group in zip(
+                                    local_attn_groups, remote_attn_groups
+                                ):
+                                    if len(local_attn) > len(remote_group):
+                                        local_attn = local_attn[: len(remote_group)]
+                                    elif len(local_attn) != len(remote_group):
+                                        local_attn = remote_group[-len(local_attn) :]
+                                    reconciled_attn_groups.append(local_attn)
+                                local_attn_groups = reconciled_attn_groups
+                            elif len(local_attn_groups) == 1 and len(
+                                local_attn_groups[0]
+                            ) > len(remote_attn):
                                 # Speculative decode (e.g. dspark) reserves extra
                                 # lookahead blocks on the decoder, so it can allocate
                                 # more attention blocks than the prefiller holds. Only
@@ -849,10 +872,18 @@ class MoRIIOConnectorScheduler:
                                 # occupies the leading local blocks, so pull
                                 # remote_attn[i] -> local_attn[i] and let the extra
                                 # lookahead blocks fill during generation.
-                                local_attn = local_attn[: len(remote_attn)]
-                            elif len(local_attn) != len(remote_attn):
-                                local_attn = remote_attn[-len(local_attn) :]
-                            local_block_ids = [local_attn, mamba_block_ids]
+                                local_attn_groups = [
+                                    local_attn_groups[0][: len(remote_attn)]
+                                ]
+                            elif len(local_attn_groups) == 1 and len(
+                                local_attn_groups[0]
+                            ) != len(remote_attn):
+                                local_attn_groups = [
+                                    remote_attn[-len(local_attn_groups[0]) :]
+                                ]
+                            local_block_ids = pack_attn_mamba_block_ids(
+                                local_attn_groups, mamba_block_ids
+                            )
                         else:
                             # Attention needs no pull (full prefix-cache hit, or
                             # the len-1 READ accounting yields zero external attn
@@ -865,8 +896,8 @@ class MoRIIOConnectorScheduler:
                             _, mamba_block_ids = self.split_block_groups(
                                 blocks.get_block_ids()
                             )
-                            local_block_ids = (
-                                [[], mamba_block_ids] if mamba_block_ids else []
+                            local_block_ids = pack_attn_mamba_block_ids(
+                                [[]], mamba_block_ids
                             )
 
                         self._reqs_need_recv[request.request_id] = (
@@ -970,19 +1001,16 @@ class MoRIIOConnectorScheduler:
                     # notify just the mamba slot so the producer still writes the
                     # recurrent state into the decoder's blocks.
                     if num_external_tokens > 0:
-                        attn_notify, mamba_notify = self.split_block_groups(
+                        block_notify_list = self.pack_block_groups(
                             blocks.get_block_ids()
-                        )
-                        # One block-ids channel: attn + mamba together (or flat
-                        # attn when there is no mamba group).
-                        block_notify_list = (
-                            [attn_notify, mamba_notify] if mamba_notify else attn_notify
                         )
                     else:
                         _, mamba_notify = self.split_block_groups(
                             blocks.get_block_ids()
                         )
-                        block_notify_list = [[], mamba_notify] if mamba_notify else []
+                        block_notify_list = pack_attn_mamba_block_ids(
+                            [[]], mamba_notify
+                        )
 
                     # Wide-EP multi-pod: a pod binds notify sockets only for
                     # its LOCAL ranks, so the port offset must use the per-pod
@@ -1041,20 +1069,36 @@ class MoRIIOConnectorScheduler:
                     # EngineCore. Skip it silently.
                     if req_id not in self._reqs_need_pending_save:
                         continue
-                    attn_block_ids, mamba_block_ids = self.split_block_groups(
+                    attn_groups, mamba_block_ids = self.split_block_groups_grouped(
                         new_block_ids
                     )
                     req, existing_blocks = self._reqs_need_pending_save[req_id]
                     # Accumulate attention blocks across chunks; keep the single
                     # mamba slot. Both ride the one [attn, mamba] value.
-                    ex_attn, ex_mamba = as_attn_mamba(existing_blocks)
-                    updated_attn = list(ex_attn) + attn_block_ids
+                    ex_attn_groups, ex_mamba = as_attn_groups_mamba(existing_blocks)
+                    group_count = max(len(ex_attn_groups), len(attn_groups))
+                    updated_attn_groups = []
+                    for group_idx in range(group_count):
+                        old_group = (
+                            ex_attn_groups[group_idx]
+                            if group_idx < len(ex_attn_groups)
+                            else []
+                        )
+                        new_group = (
+                            attn_groups[group_idx]
+                            if group_idx < len(attn_groups)
+                            else []
+                        )
+                        updated_attn_groups.append(list(old_group) + list(new_group))
                     updated_mamba = mamba_block_ids or ex_mamba
                     self._reqs_need_pending_save[req_id] = (
                         req,
-                        [updated_attn, updated_mamba],
+                        pack_attn_mamba_block_ids(updated_attn_groups, updated_mamba),
                     )
-                    if len(updated_attn) * self.block_size >= req.num_prompt_tokens:
+                    primary_attn_len = (
+                        len(updated_attn_groups[0]) if updated_attn_groups else 0
+                    )
+                    if primary_attn_len * self.block_size >= req.num_prompt_tokens:
                         # Final chunk: live kv_transfer_params may be cleared,
                         # so prefer the snapshot from update_state_after_alloc.
                         kv_params = self._req_kv_params.pop(
@@ -1062,7 +1106,9 @@ class MoRIIOConnectorScheduler:
                         )
                         meta.add_new_req(
                             request_id=req_id,
-                            local_block_ids=[updated_attn, updated_mamba],
+                            local_block_ids=pack_attn_mamba_block_ids(
+                                updated_attn_groups, updated_mamba
+                            ),
                             kv_transfer_params=kv_params,
                             write_mode=True,
                         )
@@ -1079,8 +1125,9 @@ class MoRIIOConnectorScheduler:
 
         for req_id, (req, block_ids) in self._reqs_need_save.items():
             kv_params = self._req_kv_params.get(req_id, req.kv_transfer_params or {})
-            attn_ids, _ = as_attn_mamba(block_ids)
-            if req.num_prompt_tokens > len(attn_ids) * self.block_size:
+            attn_groups, _ = as_attn_groups_mamba(block_ids)
+            primary_attn_len = len(attn_groups[0]) if attn_groups else 0
+            if req.num_prompt_tokens > primary_attn_len * self.block_size:
                 # not last chunk prefill; keep the mamba slot for the final chunk
                 self._reqs_need_pending_save[req_id] = (req, block_ids)
                 continue
@@ -1174,6 +1221,32 @@ class MoRIIOConnectorScheduler:
             # or the previous step's superseded state.
             blocks = blocks[-1:]
         return blocks
+
+    def split_block_groups_grouped(
+        self, block_ids: "tuple[list[int], ...]"
+    ) -> tuple[list[list[int]], list[int]]:
+        """Split per-group block ids without flattening attention groups.
+
+        Mamba groups are clipped exactly as in ``split_block_groups``; only the
+        attention side differs, in that each group stays addressable on its own.
+        """
+        if not self._has_mamba and len(self._attn_group_ids) <= 1:
+            first = block_ids[0] if block_ids else []
+            return [list(first)], []
+        attn_groups: list[list[int]] = []
+        mamba: list[int] = []
+        for gi, group in enumerate(block_ids):
+            if gi in self._mamba_group_ids:
+                mamba.extend(self._clip_mamba_group(gi, list(group)))
+            elif gi in self._attn_group_ids:
+                attn_groups.append(list(group))
+        if not attn_groups:
+            attn_groups.append([])
+        return attn_groups, mamba
+
+    def pack_block_groups(self, block_ids: "tuple[list[int], ...]") -> list:
+        attn_groups, mamba_block_ids = self.split_block_groups_grouped(block_ids)
+        return pack_attn_mamba_block_ids(attn_groups, mamba_block_ids)
 
     def request_finished(
         self,
@@ -1397,6 +1470,13 @@ class MoRIIOConnectorWorker:
         self.kv_transfer_config = vllm_config.kv_transfer_config
         self.is_producer = self.kv_transfer_config.is_kv_producer
         self.layer_to_spec = build_layer_to_spec(kv_cache_config)
+        self._attn_group_ids, self._mamba_group_ids = _split_kv_cache_group_kinds(
+            kv_cache_config
+        )
+        self._layer_to_attn_group_pos: dict[str, int] = {}
+        for pos, group_idx in enumerate(self._attn_group_ids):
+            for layer_name in kv_cache_config.kv_cache_groups[group_idx].layer_names:
+                self._layer_to_attn_group_pos[layer_name] = pos
 
         if self.is_producer:
             set_role(ROLE.PRODUCER)
@@ -3154,6 +3234,24 @@ class MoRIIOConnectorWorker:
             remote = [x + remote_off for x in remote]
         return local, remote, sizes
 
+    def _select_attention_blocks_for_layer(
+        self,
+        layer_name: str,
+        block_ids: list,
+    ) -> list[int]:
+        attn_groups, _ = as_attn_groups_mamba(block_ids)
+        if len(attn_groups) == 1:
+            return list(attn_groups[0])
+        group_pos = self._layer_to_attn_group_pos.get(layer_name)
+        if group_pos is None:
+            raise MoRIIOError(
+                f"Attention layer {layer_name} is not present in the local "
+                "KV-cache group mapping"
+            )
+        if group_pos >= len(attn_groups):
+            return []
+        return list(attn_groups[group_pos])
+
     def _region_session_indices(self, layer_name: str) -> list[int]:
         """Flat session indices for a layer's registered regions.
 
@@ -3209,16 +3307,20 @@ class MoRIIOConnectorWorker:
         # This moves valid state slots without over-/under-running either side;
         # exact per-layer P<->D group remapping under asymmetric grouping is a
         # follow-up for spec-decode accuracy.
-        if len(local_slots) != len(remote_slots) and remote_slots:
+        if len(local_slots) != len(remote_slots) and remote_slots and local_slots:
             if len(local_slots) % len(remote_slots) == 0:
-                # With symmetric mamba grouping (same #groups on prefill and
-                # decode), the decoder reserves an align window of
-                # (num_spec+1) blocks per mamba group under spec decode while
-                # the prefiller holds a single slot per group. The flattened
-                # slot list is group-major, so transfer the prefiller's slot
-                # into each decode group's base (window-start) slot.
+                # READ direction: decode local slots include the speculative
+                # align window while prefill remote slots hold one current
+                # state per group. Transfer into each local base slot.
                 window = len(local_slots) // len(remote_slots)
                 local_slots = local_slots[::window]
+            elif len(remote_slots) % len(local_slots) == 0:
+                # WRITE direction: prefill local slots hold one current state
+                # per group while decode remote slots include the speculative
+                # align window. Transfer from each local slot into the remote
+                # base slot.
+                window = len(remote_slots) // len(local_slots)
+                remote_slots = remote_slots[::window]
             else:
                 # Fallback for asymmetric grouping: tail-align to the common
                 # slot count (bringup-safe; avoids over-/under-running).
@@ -3332,8 +3434,10 @@ class MoRIIOConnectorWorker:
             return
 
         # Both halves ride the one block-ids channel; split at the point of use.
-        local_attn, local_mamba = as_attn_mamba(local_block_ids)
-        remote_attn, remote_mamba = as_attn_mamba(remote_block_ids)
+        local_attn_groups, local_mamba = as_attn_groups_mamba(local_block_ids)
+        remote_attn_groups, remote_mamba = as_attn_groups_mamba(remote_block_ids)
+        local_attn_all = [bid for group in local_attn_groups for bid in group]
+        remote_attn_all = [bid for group in remote_attn_groups for bid in group]
 
         # Read from the prefill rank that actually computed this request's KV
         # (forwarded by the proxy). Hardcoding DP0 reads from a different rank's
@@ -3374,7 +3478,7 @@ class MoRIIOConnectorWorker:
                 # KDA layer: pull conv (sub-projection offsets) and ssm at the
                 # request's recurrent-state slot. Two regions -> two sessions.
                 if not local_mamba or not remote_mamba:
-                    if not local_attn and not remote_attn:
+                    if not local_attn_all and not remote_attn_all:
                         # Whole-request no-op (e.g. full prefix cache hit):
                         # nothing to transfer for any layer.
                         continue
@@ -3420,6 +3524,14 @@ class MoRIIOConnectorWorker:
                         )
                     )
             else:
+                local_attn = self._select_attention_blocks_for_layer(
+                    layer_name, local_block_ids
+                )
+                remote_attn = self._select_attention_blocks_for_layer(
+                    layer_name, remote_block_ids
+                )
+                if not local_attn or not remote_attn:
+                    continue
                 offs = self._compute_block_transfer_offsets(
                     layer_name,
                     local_attn,
@@ -3443,7 +3555,7 @@ class MoRIIOConnectorWorker:
                 self._recving_transfers[request_id][layer_name] = statuses
                 self._recving_transfers_start.setdefault(request_id, time.monotonic())
                 # Destination blocks, kept for _record_failed_recv.
-                self._recving_local_blocks.setdefault(request_id, list(local_attn))
+                self._recving_local_blocks.setdefault(request_id, list(local_attn_all))
                 # Awaited before the forward when the per-layer barrier cannot
                 # run (see _await_reads_issued_this_step).
                 self._reads_issued_this_step.extend(statuses)
