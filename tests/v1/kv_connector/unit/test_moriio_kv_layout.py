@@ -370,6 +370,7 @@ def test_write_transfer_plan_caches_offsets_per_layer_geometry():
             remote_block_ids,
             remote_moriio_meta,
             remote_engine_id=None,
+            **kwargs,
         ):
             calls.append(layer_name)
             call_id = len(calls)

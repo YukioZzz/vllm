@@ -410,6 +410,9 @@ class MoRIIOWriter:
                 remote_attn,
                 remote_moriio_meta,
                 remote_engine_id=task.dst_engine_id,
+                # The producer performs the DCP relayout, so it needs the
+                # consumer's degree; the decoder reported it with its blocks.
+                decode_dcp_size=request_info.decode_dcp_size,
             )
             request_info.transfer_offsets[key] = offsets
 
@@ -951,6 +954,7 @@ class MoRIIOWrapper:
         transfer_id = data["transfer_id"]
         block_notify_list = data.get("block_notify_list", [])
         decode_dp_rank = data.get("decode_rank", 0)
+        decode_dcp_size = max(1, int(data.get("decode_dcp_size") or 1))
         if not block_notify_list:
             raise MoRIIOError(
                 "block_notify_list cannot be empty in remote allocate message"
@@ -966,6 +970,7 @@ class MoRIIOWrapper:
             self.done_remote_allocate_req_dict[transfer_id] = RemoteAllocInfo(
                 block_ids=block_notify_list,
                 decode_dp_rank=decode_dp_rank,
+                decode_dcp_size=decode_dcp_size,
             )
 
     def _handle_write_done_message(self, data: dict):
