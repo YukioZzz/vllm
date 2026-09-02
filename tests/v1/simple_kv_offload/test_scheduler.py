@@ -2089,12 +2089,14 @@ def _make_hybrid_attention_mamba_scheduler(
     num_gpu_blocks: int = 16,
     attention_block_size: int = BLOCK_SIZE,
     block_size: int = 4 * BLOCK_SIZE,
+    scheduler_block_size: int | None = None,
     hash_block_size: int | None = None,
     dcp_world_size: int = 4,
     lazy: bool = False,
     mamba_cache_mode: str = "align",
 ) -> SchedulerFixture:
     """Build a scheduler for one attention group plus one Mamba group."""
+    scheduler_block_size = scheduler_block_size or block_size
     hash_block_size = hash_block_size or block_size
     attention_spec = FullAttentionSpec(
         block_size=attention_block_size,
@@ -2133,7 +2135,7 @@ def _make_hybrid_attention_mamba_scheduler(
         vllm_config=vllm_config,
         kv_cache_config=kv_cache_config,
         cpu_capacity_bytes=cpu_capacity_bytes,
-        scheduler_block_size=block_size,
+        scheduler_block_size=scheduler_block_size,
         hash_block_size=hash_block_size,
         lazy_offload=lazy,
     )
@@ -2268,6 +2270,85 @@ def test_dcp_mixed_cache_loads_fine_grained_external_hit() -> None:
         load_blocks.blocks[1][2].block_id,
     ]
     assert len(load_meta.load_cpu_blocks) == 4
+
+
+def test_finished_eager_store_caches_fa_partial_tail_for_hybrid_hit() -> None:
+    """A finished non-LCM prompt needs the FA partial tail in CPU too."""
+    hash_block_size = BLOCK_SIZE
+    mamba_block_size = BLOCK_SIZE
+    attention_block_size = 4 * BLOCK_SIZE
+    dcp_world_size = 2
+    scheduler_block_size = attention_block_size * dcp_world_size
+    total_cached_tokens = 5 * hash_block_size
+    fix = _make_hybrid_attention_mamba_scheduler(
+        num_cpu_blocks=32,
+        num_gpu_blocks=32,
+        attention_block_size=attention_block_size,
+        block_size=mamba_block_size,
+        scheduler_block_size=scheduler_block_size,
+        hash_block_size=hash_block_size,
+        dcp_world_size=dcp_world_size,
+    )
+    sched = fix.scheduler
+    gpu_pool = fix.gpu_block_pool
+    assert sched.fa_block_size == scheduler_block_size
+    assert total_cached_tokens % sched.fa_block_size != 0
+
+    producer = _make_cp_request(num_blocks=5, virtual_block_size=hash_block_size)
+    attention_blocks = gpu_pool.get_new_blocks(1)
+    gpu_pool.cache_partial_block(
+        request=producer,
+        block=attention_blocks[0],
+        num_tokens=total_cached_tokens,
+        kv_cache_group_id=0,
+        block_size=scheduler_block_size,
+    )
+    mamba_blocks = gpu_pool.get_new_blocks(5)
+    gpu_pool.cache_full_blocks(
+        request=producer,
+        blocks=mamba_blocks,
+        num_cached_blocks=0,
+        num_full_blocks=5,
+        kv_cache_group_id=1,
+        block_size=mamba_block_size,
+    )
+    producer_blocks = KVCacheBlocks(blocks=(attention_blocks, mamba_blocks))
+    sched.update_state_after_alloc(producer, producer_blocks, num_external_tokens=0)
+
+    store_output = make_scheduler_output(
+        {producer.request_id: total_cached_tokens},
+        new_reqs={producer.request_id: producer_blocks.get_block_ids()},
+    )
+    store_output.kv_connector_block_state = KVConnectorBlockState(
+        block_ids={},
+        boundary_state_offloads={
+            producer.request_id: [
+                (1, mamba_blocks[4].block_id, total_cached_tokens),
+            ]
+        },
+    )
+    store_meta = sched.build_connector_meta(store_output)
+    simulate_store_completion(sched, store_meta.store_event)
+
+    producer.num_computed_tokens = total_cached_tokens
+    sched.request_finished_all_groups(producer, producer_blocks.get_block_ids())
+    finish_meta = sched.build_connector_meta(make_scheduler_output({}))
+    assert attention_blocks[0].block_id in finish_meta.store_gpu_blocks
+    simulate_store_completion(sched, finish_meta.store_event)
+
+    consumer = Request(
+        request_id="req-finished-partial-tail-load",
+        prompt_token_ids=producer.prompt_token_ids,
+        sampling_params=producer.sampling_params,
+        pooling_params=None,
+        mm_features=None,
+        block_hasher=producer._block_hasher,
+    )
+    hit_tokens, is_async = sched.get_num_new_matched_tokens(
+        consumer, num_computed_tokens=0
+    )
+    assert hit_tokens == total_cached_tokens
+    assert is_async is True
 
 
 def test_external_lookup_rejects_misaligned_local_prefix(caplog) -> None:
