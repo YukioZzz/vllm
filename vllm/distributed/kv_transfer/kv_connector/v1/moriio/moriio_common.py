@@ -82,13 +82,23 @@ class WriteTask:
     event: torch.cuda.Event
     remote_notify_port: int
     remote_ip: str
+    # Peer TP degree, forwarded so the WRITE path can reject heterogeneous-TP
+    # recurrent-state transfers instead of silently writing homogeneous-layout
+    # bytes. 0 means unknown (treated as homogeneous).
+    remote_tp_size: int = 0
     enqueue_time: float = field(default_factory=time.perf_counter)
     retried: int = 0
 
 
 @dataclass
 class LayerTransferPlan:
-    """Plan for transferring a single layer."""
+    """Plan for transferring a single layer.
+
+    For attention layers ``sess_idx`` + ``transfer_*`` describe the one
+    transfer. For KDA layers the conv state uses ``sess_idx`` / ``transfer_*``
+    and the ssm state uses ``ssm_sess_idx`` / ``ssm_*`` (two registered regions
+    per layer, hence two sessions), issued as one scheduled write.
+    """
 
     request_id: ReqId
     transfer_id: TransferId
@@ -98,6 +108,11 @@ class LayerTransferPlan:
     transfer_remote_offsets: list[int]
     transfer_sizes: list[int]
     use_batch: bool = True
+    is_mamba: bool = False
+    ssm_sess_idx: int | None = None
+    ssm_local_offsets: list[int] = field(default_factory=list)
+    ssm_remote_offsets: list[int] = field(default_factory=list)
+    ssm_sizes: list[int] = field(default_factory=list)
 
 
 @dataclass

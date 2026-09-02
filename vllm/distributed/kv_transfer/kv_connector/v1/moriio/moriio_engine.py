@@ -33,6 +33,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     TransferError,
     TransferId,
     WriteTask,
+    as_attn_mamba,
     get_port_offset,
     get_role,
     zmq_ctx,
@@ -384,14 +385,21 @@ class MoRIIOWriter:
         Returns:
             The transfer plan
         """
+        if self.worker._is_mamba_layer(task.layer_name):
+            return self._prepare_mamba_transfer_plan(task, request_info)
+
         layer_cache = self.worker.kv_caches[task.layer_name]
         key = (task.layer_name, *_get_write_geometry_key(layer_cache))
         offsets = request_info.transfer_offsets.get(key)
         if offsets is None:
+            # local/remote block ids carry [attn, mamba]; attention layers use
+            # the attention half.
+            local_attn, _ = as_attn_mamba(task.local_block_ids)
+            remote_attn, _ = as_attn_mamba(request_info.block_ids)
             offsets = self.worker._compute_block_transfer_offsets(
                 task.layer_name,
-                task.local_block_ids,
-                request_info.block_ids,
+                local_attn,
+                remote_attn,
                 remote_moriio_meta,
                 remote_engine_id=task.dst_engine_id,
             )
@@ -414,6 +422,45 @@ class MoRIIOWriter:
             use_batch=True,
         )
 
+    def _prepare_mamba_transfer_plan(
+        self,
+        task: WriteTask,
+        request_info: RemoteAllocInfo,
+    ) -> LayerTransferPlan:
+        """Build a conv+ssm write plan for a KDA layer.
+
+        The layer has two registered regions (conv, ssm) -> two sessions. Both
+        are issued as one scheduled write (seal_pending_transfers counts one
+        write per (transfer_id, layer_name), and writes_done is incremented once
+        per task regardless of how many session writes fire), so no attention-
+        layer-count threshold is needed.
+        """
+        # KDA layers use the mamba half of the carried [attn, mamba] block ids.
+        _, local_mamba = as_attn_mamba(task.local_block_ids)
+        _, remote_mamba = as_attn_mamba(request_info.block_ids)
+        local, remote, sizes, n_conv = self.worker._compute_mamba_transfer_offsets(
+            task.layer_name,
+            local_mamba,
+            remote_mamba,
+            remote_tp_size=task.remote_tp_size or None,
+        )
+        region_sessions = self.worker._region_session_indices(task.layer_name)
+        return LayerTransferPlan(
+            request_id=task.request_id,
+            transfer_id=task.transfer_id,
+            layer_name=task.layer_name,
+            sess_idx=region_sessions[0],
+            transfer_local_offsets=local[:n_conv],
+            transfer_remote_offsets=remote[:n_conv],
+            transfer_sizes=sizes[:n_conv],
+            use_batch=True,
+            is_mamba=True,
+            ssm_sess_idx=region_sessions[1],
+            ssm_local_offsets=local[n_conv:],
+            ssm_remote_offsets=remote[n_conv:],
+            ssm_sizes=sizes[n_conv:],
+        )
+
     def _do_layer_write(self, plan: LayerTransferPlan, sessions: list) -> list[Any]:
         """Perform the actual layer write.
 
@@ -421,6 +468,32 @@ class MoRIIOWriter:
             plan: The transfer plan
             sessions: List of transfer sessions
         """
+        if plan.is_mamba:
+            # KDA layer: batched conv write on the conv session and batched ssm
+            # write on the ssm session (two regions), collected as this task's
+            # transfer statuses.
+            mamba_statuses: list[Any] = []
+            if plan.transfer_sizes:
+                mamba_statuses.append(
+                    self.worker.moriio_wrapper.write_remote_data(
+                        plan.transfer_sizes,
+                        plan.transfer_local_offsets,
+                        plan.transfer_remote_offsets,
+                        sessions[plan.sess_idx],
+                    )
+                )
+            if plan.ssm_sizes:
+                assert plan.ssm_sess_idx is not None
+                mamba_statuses.append(
+                    self.worker.moriio_wrapper.write_remote_data(
+                        plan.ssm_sizes,
+                        plan.ssm_local_offsets,
+                        plan.ssm_remote_offsets,
+                        sessions[plan.ssm_sess_idx],
+                    )
+                )
+            return mamba_statuses
+
         if plan.use_batch:
             return [
                 self.worker.moriio_wrapper.write_remote_data(
@@ -884,7 +957,8 @@ class MoRIIOWrapper:
                 )
                 return
             self.done_remote_allocate_req_dict[transfer_id] = RemoteAllocInfo(
-                block_ids=block_notify_list, decode_dp_rank=decode_dp_rank
+                block_ids=block_notify_list,
+                decode_dp_rank=decode_dp_rank,
             )
 
     def _handle_write_done_message(self, data: dict):

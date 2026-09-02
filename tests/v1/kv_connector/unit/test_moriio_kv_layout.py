@@ -357,6 +357,9 @@ def test_write_transfer_plan_caches_offsets_per_layer_geometry():
         kv_caches: dict[str, torch.Tensor]
         layer_name_to_local_kv_cache_metadata: dict[str, list[Any]]
 
+        def _is_mamba_layer(self, layer_name):
+            return False
+
         def _region_session_indices(self, layer_name):
             return [list(self.kv_caches).index(layer_name)]
 

@@ -400,6 +400,19 @@ class MoRIIOConnector(KVConnectorBase_V1, SupportsHMA):
         )
         self.connector_worker.wait_for_save(self._connector_metadata)
 
+    def has_pending_push_work(self) -> bool:
+        """True while a producer request's blocks are held pending its ACK.
+
+        The scheduler calls this on the SCHEDULER-role connector, so it must be
+        answered from scheduler state: a worker-side answer is never reached and
+        the engine would quiesce with transfers still in flight. KDA conv+ssm
+        writes fire from wait_for_save rather than the per-layer hook, which
+        makes that window longer, not shorter.
+        """
+        if self.connector_scheduler is not None:
+            return self.connector_scheduler.has_pending_push_work()
+        return False
+
     def shutdown(self):
         if self.connector_worker is not None:
             self.connector_worker.shutdown()
@@ -940,11 +953,28 @@ class MoRIIOConnectorScheduler:
                                 f"remote_notify_port={remote_notify_port!r})"
                             )
 
-                    # num_external_tokens == 0: nothing to push, so don't tell
-                    # the producer to write into these blocks.
-                    block_notify_list = (
-                        blocks.get_block_ids()[0] if num_external_tokens > 0 else []
-                    )
+                    remote_notify_port = int(remote_notify_port)
+
+                    # Attention may need nothing pushed (num_external_tokens == 0
+                    # on a cache hit / len-1 accounting), but the per-request KDA
+                    # recurrent state is not prefix-cacheable and must still be
+                    # pushed. With attn tokens, notify [attn, mamba]; otherwise
+                    # notify just the mamba slot so the producer still writes the
+                    # recurrent state into the decoder's blocks.
+                    if num_external_tokens > 0:
+                        attn_notify, mamba_notify = self.split_block_groups(
+                            blocks.get_block_ids()
+                        )
+                        # One block-ids channel: attn + mamba together (or flat
+                        # attn when there is no mamba group).
+                        block_notify_list = (
+                            [attn_notify, mamba_notify] if mamba_notify else attn_notify
+                        )
+                    else:
+                        _, mamba_notify = self.split_block_groups(
+                            blocks.get_block_ids()
+                        )
+                        block_notify_list = [[], mamba_notify] if mamba_notify else []
 
                     # Wide-EP multi-pod: a pod binds notify sockets only for
                     # its LOCAL ranks, so the port offset must use the per-pod
@@ -997,21 +1027,26 @@ class MoRIIOConnectorScheduler:
                 new_block_ids = scheduler_output.scheduled_cached_reqs.new_block_ids[i]
 
                 if new_block_ids is not None:
-                    block_ids = new_block_ids[0]
-                    # TODO : hybrid attn, etc
                     # A non-disagg request (no kv_transfer_params, e.g. smoke
                     # test) is never registered in _reqs_need_pending_save;
                     # indexing it unconditionally would KeyError and crash the
                     # EngineCore. Skip it silently.
                     if req_id not in self._reqs_need_pending_save:
                         continue
+                    attn_block_ids, mamba_block_ids = self.split_block_groups(
+                        new_block_ids
+                    )
                     req, existing_blocks = self._reqs_need_pending_save[req_id]
-                    updated_blocks = list(existing_blocks) + (block_ids)
-                    self._reqs_need_pending_save[req_id] = (req, updated_blocks)
-                    if (
-                        len(self._reqs_need_pending_save[req_id][1]) * self.block_size
-                        >= req.num_prompt_tokens
-                    ):
+                    # Accumulate attention blocks across chunks; keep the single
+                    # mamba slot. Both ride the one [attn, mamba] value.
+                    ex_attn, ex_mamba = as_attn_mamba(existing_blocks)
+                    updated_attn = list(ex_attn) + attn_block_ids
+                    updated_mamba = mamba_block_ids or ex_mamba
+                    self._reqs_need_pending_save[req_id] = (
+                        req,
+                        [updated_attn, updated_mamba],
+                    )
+                    if len(updated_attn) * self.block_size >= req.num_prompt_tokens:
                         # Final chunk: live kv_transfer_params may be cleared,
                         # so prefer the snapshot from update_state_after_alloc.
                         kv_params = self._req_kv_params.pop(
@@ -1019,7 +1054,7 @@ class MoRIIOConnectorScheduler:
                         )
                         meta.add_new_req(
                             request_id=req_id,
-                            local_block_ids=self._reqs_need_pending_save[req_id][1],
+                            local_block_ids=[updated_attn, updated_mamba],
                             kv_transfer_params=kv_params,
                             write_mode=True,
                         )
@@ -1036,8 +1071,9 @@ class MoRIIOConnectorScheduler:
 
         for req_id, (req, block_ids) in self._reqs_need_save.items():
             kv_params = self._req_kv_params.get(req_id, req.kv_transfer_params or {})
-            if req.num_prompt_tokens > len(block_ids) * self.block_size:
-                # not last chunk prefill
+            attn_ids, _ = as_attn_mamba(block_ids)
+            if req.num_prompt_tokens > len(attn_ids) * self.block_size:
+                # not last chunk prefill; keep the mamba slot for the final chunk
                 self._reqs_need_pending_save[req_id] = (req, block_ids)
                 continue
             meta.add_new_req(
@@ -1064,6 +1100,17 @@ class MoRIIOConnectorScheduler:
         self._reqs_need_send = {}
 
         return meta
+
+    def has_pending_push_work(self) -> bool:
+        """True while a finished producer request still holds blocks for a peer.
+
+        ``request_finished`` returns ``delay_free_blocks=True`` for a producer
+        request and parks it in ``_deferred_send_deadlines`` until the peer's
+        release ACK arrives. The engine must keep stepping until then, or the
+        worker never gets the step in which it would observe the ACK. Bounded:
+        an entry that never gets its ACK is reaped after ``defer_timeout``.
+        """
+        return bool(self._deferred_send_deadlines)
 
     def shutdown(self):
         for path, sock in self.paths.items():
@@ -1571,6 +1618,7 @@ class MoRIIOConnectorWorker:
         kv_layer: torch.Tensor,
         remote_notify_port: int,
         remote_ip: str,
+        remote_tp_size: int = 0,
     ) -> None:
         """Schedule a block write operation.
 
@@ -1584,6 +1632,7 @@ class MoRIIOConnectorWorker:
             kv_layer: KV cache tensor
             remote_notify_port: Port for completion notification
             remote_ip: IP address of remote node
+            remote_tp_size: Peer TP degree (0 == unknown/homogeneous)
         """
 
         # synchronization to prevent dirty reads between
@@ -1605,6 +1654,7 @@ class MoRIIOConnectorWorker:
             event=event,
             remote_notify_port=remote_notify_port,
             remote_ip=remote_ip,
+            remote_tp_size=remote_tp_size,
         )
         self._writer.schedule_write(task)
 
@@ -2394,7 +2444,10 @@ class MoRIIOConnectorWorker:
     def wait_for_layer_load(self, layer_name: str) -> None:
         """Block until all in-flight READs of this layer have landed.
 
-        A host-side blocking wait must not run during full-graph capture.
+        Per-layer, so the forward's early layers overlap the transfers still
+        outstanding for later layers. A host-side blocking wait must not run
+        during full-graph capture; there _await_reads_issued_this_step stands in
+        at step granularity.
         """
         if self.is_producer or self.mode != MoRIIOMode.READ:
             return
@@ -2950,6 +3003,7 @@ class MoRIIOConnectorWorker:
             kv_layer=kv_layer,
             remote_notify_port=meta.remote_notify_port,
             remote_ip=meta.remote_host,
+            remote_tp_size=int(meta.tp_size or 0),
         )
 
     def merge_contiguous_blocks(
