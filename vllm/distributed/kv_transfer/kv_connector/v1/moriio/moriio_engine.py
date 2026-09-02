@@ -400,20 +400,28 @@ class MoRIIOWriter:
         key = (task.layer_name, *_get_write_geometry_key(layer_cache))
         offsets = request_info.transfer_offsets.get(key)
         if offsets is None:
-            # local/remote block ids carry [attn, mamba]; attention layers use
-            # the attention half.
-            local_attn, _ = as_attn_mamba(task.local_block_ids)
-            remote_attn, _ = as_attn_mamba(request_info.block_ids)
-            offsets = self.worker._compute_block_transfer_offsets(
-                task.layer_name,
-                local_attn,
-                remote_attn,
-                remote_moriio_meta,
-                remote_engine_id=task.dst_engine_id,
-                # The producer performs the DCP relayout, so it needs the
-                # consumer's degree; the decoder reported it with its blocks.
-                decode_dcp_size=request_info.decode_dcp_size,
+            # The block ids carry every attention group plus mamba; a layer only
+            # transfers the blocks of the group it belongs to.
+            local_attn = self.worker._select_attention_blocks_for_layer(
+                task.layer_name, task.local_block_ids
             )
+            remote_attn = self.worker._select_attention_blocks_for_layer(
+                task.layer_name, request_info.block_ids
+            )
+            if not local_attn or not remote_attn:
+                offsets = ([], [], [])
+            else:
+                offsets = self.worker._compute_block_transfer_offsets(
+                    task.layer_name,
+                    local_attn,
+                    remote_attn,
+                    remote_moriio_meta,
+                    remote_engine_id=task.dst_engine_id,
+                    # The producer performs the DCP relayout, so it needs the
+                    # consumer's degree; the decoder reported it with its blocks.
+                    decode_dcp_size=request_info.decode_dcp_size,
+                    num_prompt_tokens=task.num_prompt_tokens,
+                )
             request_info.transfer_offsets[key] = offsets
 
         # One session per registered region; attention layers map to a single

@@ -8,6 +8,7 @@ import pytest
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     MoRIIOMode,
     MoRIIOTransferAck,
+    TransferBatchState,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector import (
     MoRIIOConnector,
@@ -287,18 +288,23 @@ def test_read_completion_sends_structured_release_with_consumer_tp_size():
         ):
             self.sent.append((transfer_id, host, port, message_type, message_fields))
 
+        def poll_transfer_batch(self, statuses):
+            assert statuses
+            return TransferBatchState.DONE
+
         def shutdown(self):
             pass
 
     worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
     worker.world_size = 8
     worker.moriio_wrapper = FakeWrapper()
-    worker._recving_transfers = {"req": {"layer0": DoneStatus()}}
+    worker._recving_transfers = {"req": {"layer0": [DoneStatus()]}}
     worker._recving_transfers_callback_addr = {
         "req": ("127.0.0.1", "7000", "tx-release")
     }
     # Transfer-timeout reaping state consulted by _pop_done_transfers.
     worker._recving_transfers_start = {}
+    worker._recving_local_blocks = {}
 
     assert worker._pop_done_transfers() == {"tx-release"}
     assert worker.moriio_wrapper.sent == [
