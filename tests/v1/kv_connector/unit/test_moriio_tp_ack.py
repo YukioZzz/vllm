@@ -299,7 +299,8 @@ def test_read_completion_sends_structured_release_with_consumer_tp_size():
     worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
     worker.world_size = 8
     worker.moriio_wrapper = FakeWrapper()
-    worker._recving_transfers = {"req": {"layer0": DoneStatus()}}
+    # A layer maps to the list of reads posted for it (a KDA layer posts two).
+    worker._recving_transfers = {"req": {"layer0": [DoneStatus()]}}
     worker._recving_transfers_callback_addr = {
         "req": ("127.0.0.1", "7000", "tx-release")
     }
