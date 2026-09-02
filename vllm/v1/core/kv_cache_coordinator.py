@@ -444,6 +444,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
         num_prefill_lookahead: int = 0,
+        allow_partial_hash_hits: bool = True,
     ):
         super().__init__(
             kv_cache_config,
@@ -581,6 +582,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
         num_prefill_lookahead: int = 0,
+        allow_partial_hash_hits: bool = True,
     ):
         super().__init__(
             kv_cache_config,
@@ -642,7 +644,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             )
             for g in kv_cache_config.kv_cache_groups
         )
-        self.enable_partial_hash_hits = has_partial_mamba_group
+        self.enable_partial_hash_hits = (
+            allow_partial_hash_hits and has_partial_mamba_group
+        )
         if self.enable_partial_hash_hits:
             unsupported_partial_hit_managers = {
                 type(manager).__name__
@@ -953,6 +957,7 @@ def get_kv_cache_coordinator(
     hash_block_size: int,
     metrics_collector: KVCacheMetricsCollector | None = None,
     num_prefill_lookahead: int = 0,
+    allow_partial_hash_hits: bool = True,
 ) -> KVCacheCoordinator:
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(
@@ -996,4 +1001,5 @@ def get_kv_cache_coordinator(
         hash_block_size=hash_block_size,
         metrics_collector=metrics_collector,
         num_prefill_lookahead=num_prefill_lookahead,
+        allow_partial_hash_hits=allow_partial_hash_hits,
     )

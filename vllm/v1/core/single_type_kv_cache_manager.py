@@ -41,6 +41,7 @@ class SingleTypeKVCacheManager(ABC):
     """
 
     supports_fine_grained_hash_lookup: ClassVar[bool] = False
+    has_positionally_stable_blocks: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -1370,6 +1371,10 @@ class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
 
 class MambaManager(SingleTypeKVCacheManager):
     supports_fine_grained_hash_lookup: ClassVar[bool] = True
+
+    @property
+    def has_positionally_stable_blocks(self) -> bool:
+        return self.mamba_cache_mode != "align"
 
     def __init__(
         self, kv_cache_spec: MambaSpec, block_pool: BlockPool, **kwargs
