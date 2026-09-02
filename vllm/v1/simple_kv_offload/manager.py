@@ -77,6 +77,7 @@ class _StoreAdmission(Enum):
 class BoundaryStoreStats:
     published: int = 0
     stored: int = 0
+    dropped_misaligned: int = 0
     dropped_cpu_full: int = 0
     skipped_already_cached: int = 0
     skipped_in_flight: int = 0
@@ -441,6 +442,11 @@ class SimpleCPUOffloadScheduler:
                     store_state = self._reqs_to_store.get(req_id)
                     if store_state is not None:
                         store_state.store_events.add(store_event)
+            if self.boundary_store_stats.published and store_event % 1000 == 0:
+                logger.info(
+                    "SimpleCPU boundary store stats: %s",
+                    self.boundary_store_stats,
+                )
 
         # --- Loads ---
         load_event = -1
@@ -571,9 +577,10 @@ class SimpleCPUOffloadScheduler:
         for req_id, entries in boundary_offloads.items():
             scheduled_for_req = False
             for _, gpu_block_id, boundary_tokens in entries:
-                if boundary_tokens % self.hash_block_size != 0:
-                    continue
                 stats.published += 1
+                if boundary_tokens % self.hash_block_size != 0:
+                    stats.dropped_misaligned += 1
+                    continue
                 gpu_block = gpu_block_pool.blocks[gpu_block_id]
                 admission = self._classify_store_candidate(gpu_block)
                 if admission is _StoreAdmission.NULL_BLOCK:
@@ -696,15 +703,9 @@ class SimpleCPUOffloadScheduler:
             ready = min(len(group_gpu_ids), aligned_tokens // group_size)
             for gpu_block_id in group_gpu_ids[state.num_stored_blocks[g] : ready]:
                 gpu_block = self._gpu_block_pool.blocks[gpu_block_id]
-                if gpu_block.is_null or gpu_block.block_hash is None:
-                    advanced_per_group[g] += 1
-                    continue
                 if (
-                    gpu_block_id in self._in_flight_store_gpu_blocks
-                    or self.cpu_block_pool.cached_block_hash_to_block.get_one_block(
-                        gpu_block.block_hash
-                    )
-                    is not None
+                    self._classify_store_candidate(gpu_block)
+                    is not _StoreAdmission.READY
                 ):
                     advanced_per_group[g] += 1
                     continue
@@ -995,6 +996,7 @@ class SimpleCPUOffloadScheduler:
             if event_idx in self._abandoned_store_event_to_blocks
         }
         self._cursor = None
+        self.boundary_store_stats = BoundaryStoreStats()
         # NOTE: _load_event_counter / _store_event_counter are not
         # reset as they are monotonic and must stay ahead of the workers
         # high-water marks to avoid event index collisions
