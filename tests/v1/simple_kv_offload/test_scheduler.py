@@ -317,8 +317,14 @@ def test_exact_boundary_handoff_is_stored_on_final_step() -> None:
 
     assert meta.store_gpu_blocks == [blocks[0].block_id]
     assert len(meta.store_cpu_blocks) == 1
+    cpu_block = sched.cpu_block_pool.blocks[meta.store_cpu_blocks[0]]
+    assert cpu_block.block_hash_num_tokens == blocks[0].block_hash_num_tokens
     assert sched.boundary_store_stats.published == 1
     assert sched.boundary_store_stats.stored == 1
+
+    snapshot = sched.get_boundary_store_stats()
+    snapshot.published = 0
+    assert sched.boundary_store_stats.published == 1
 
     duplicate = sched.build_connector_meta(output)
     assert duplicate.store_event == -1
@@ -358,6 +364,29 @@ def test_boundary_handoff_reports_cpu_capacity_drop(caplog) -> None:
     assert sched.boundary_store_stats.stored == 0
     assert sched.boundary_store_stats.dropped_cpu_full == 1
     assert "boundary-state handoff" in caplog.text
+
+
+def test_boundary_handoff_distinguishes_invalid_sources() -> None:
+    fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=8)
+    sched = fix.scheduler
+    unhashed = fix.gpu_block_pool.get_new_blocks(1)[0]
+    output = make_scheduler_output({})
+    output.kv_connector_block_state = KVConnectorBlockState(
+        block_ids={},
+        boundary_state_offloads={
+            "req": [
+                (0, fix.gpu_block_pool.null_block.block_id, BLOCK_SIZE),
+                (0, unhashed.block_id, BLOCK_SIZE),
+            ]
+        },
+    )
+
+    meta = sched.build_connector_meta(output)
+
+    assert meta.store_event == -1
+    assert sched.boundary_store_stats.published == 2
+    assert sched.boundary_store_stats.dropped_null_block == 1
+    assert sched.boundary_store_stats.dropped_not_hashed == 1
 
 
 def simulate_load_completion(
@@ -1750,8 +1779,9 @@ def _make_hybrid_attention_mamba_scheduler(
     hash_block_size: int | None = None,
     dcp_world_size: int = 4,
     lazy: bool = False,
+    mamba_cache_mode: str = "align",
 ) -> SchedulerFixture:
-    """Build a scheduler for one attention group plus one Mamba-align group."""
+    """Build a scheduler for one attention group plus one Mamba group."""
     hash_block_size = hash_block_size or block_size
     attention_spec = FullAttentionSpec(
         block_size=attention_block_size,
@@ -1763,7 +1793,7 @@ def _make_hybrid_attention_mamba_scheduler(
         block_size=block_size,
         shapes=((1, 1),),
         dtypes=(torch.float32,),
-        mamba_cache_mode="align",
+        mamba_cache_mode=mamba_cache_mode,
     )
     groups = [
         KVCacheGroupSpec(["attention"], attention_spec),
@@ -2143,6 +2173,8 @@ def test_dcp_mixed_cache_loads_fine_grained_external_hit() -> None:
     hash_block_size = BLOCK_SIZE
     mamba_block_size = 4 * BLOCK_SIZE
     local_tokens = 4 * BLOCK_SIZE
+    # Span two Mamba blocks and end partially in the second one. This exercises
+    # both cdiv(external_tokens, mamba_block_size) > 1 and the partial tail.
     external_tokens = 6 * BLOCK_SIZE
     total_cached_tokens = local_tokens + external_tokens
     fix = _make_hybrid_attention_mamba_scheduler(
@@ -2340,3 +2372,104 @@ def test_eager_store_does_not_scan_mamba_blocks_positionally() -> None:
     assert meta2.store_event == -1
     assert meta2.store_gpu_blocks == []
     assert sched._reqs_to_store[req.request_id].num_stored_blocks == [2, 0]
+
+
+def test_eager_store_scans_mamba_all_blocks_positionally() -> None:
+    """Mamba all-mode retains positional identity and can be scanned safely."""
+    block_size = 4 * BLOCK_SIZE
+    fix = _make_hybrid_attention_mamba_scheduler(
+        num_cpu_blocks=16,
+        num_gpu_blocks=24,
+        block_size=block_size,
+        mamba_cache_mode="all",
+    )
+    sched = fix.scheduler
+    gpu_pool = fix.gpu_block_pool
+    attention_manager, mamba_manager = sched.cpu_coordinator.single_type_managers
+    assert attention_manager.has_positionally_stable_blocks
+    assert mamba_manager.has_positionally_stable_blocks
+
+    req = _make_cp_request(num_blocks=2, virtual_block_size=block_size)
+    attention_blocks = _allocate_cp_gpu_blocks(
+        gpu_pool, req, 2, virtual_block_size=block_size, group_id=0
+    )
+    mamba_blocks = _allocate_cp_gpu_blocks(
+        gpu_pool, req, 2, virtual_block_size=block_size, group_id=1
+    )
+    kv_blocks = KVCacheBlocks(blocks=(attention_blocks, mamba_blocks))
+    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
+
+    meta = sched.build_connector_meta(
+        make_scheduler_output(
+            {req.request_id: 2 * block_size},
+            new_reqs={req.request_id: kv_blocks.get_block_ids()},
+        )
+    )
+
+    assert set(meta.store_gpu_blocks) == {
+        *(block.block_id for block in attention_blocks),
+        *(block.block_id for block in mamba_blocks),
+    }
+    assert sched._reqs_to_store[req.request_id].num_stored_blocks == [2, 2]
+
+
+def test_mamba_align_handoff_drop_does_not_fall_back_to_position_scan() -> None:
+    """A dropped Mamba align handoff must not be recovered by positional scan.
+
+    Regression guard for the default sparse retention mode: if a boundary-state
+    handoff is dropped (here because the CPU pool is full), the connector must
+    not later reuse the stale block position as a DMA source. Positional scans
+    are only valid for append-only block tables.
+    """
+    block_size = 4 * BLOCK_SIZE
+    fix = _make_hybrid_attention_mamba_scheduler(
+        num_cpu_blocks=2,
+        num_gpu_blocks=24,
+        block_size=block_size,
+    )
+    sched = fix.scheduler
+    gpu_pool = fix.gpu_block_pool
+    attention_manager, mamba_manager = sched.cpu_coordinator.single_type_managers
+    assert attention_manager.has_positionally_stable_blocks
+    assert not mamba_manager.has_positionally_stable_blocks
+
+    req = _make_cp_request(num_blocks=2, virtual_block_size=block_size)
+    attn_blocks = _allocate_cp_gpu_blocks(
+        gpu_pool, req, 2, virtual_block_size=block_size, group_id=0
+    )
+    # Mamba align block table is not append-only; allocate raw blocks and only
+    # mark the boundary as hashed to mimic sparse retention behavior.
+    mamba_blocks = gpu_pool.get_new_blocks(2)
+    mamba_blocks[1].set_block_hash(
+        make_block_hash_with_group_id(req.block_hashes[1], 1)
+    )
+    kv_blocks = KVCacheBlocks(blocks=(attn_blocks, mamba_blocks))
+    req.num_computed_tokens = 0
+    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
+
+    output = make_scheduler_output(
+        {req.request_id: 2 * block_size},
+        new_reqs={req.request_id: kv_blocks.get_block_ids()},
+    )
+    output.kv_connector_block_state = KVConnectorBlockState(
+        block_ids={},
+        boundary_state_offloads={
+            req.request_id: [(1, mamba_blocks[1].block_id, 2 * block_size)]
+        },
+    )
+    # First step: store both attention blocks and the Mamba boundary.
+    meta1 = sched.build_connector_meta(output)
+    assert meta1.store_event >= 0
+    # Fill CPU pool by completing the store so the next handoff has no room.
+    simulate_store_completion(sched, meta1.store_event)
+    assert sched.boundary_store_stats.stored >= 1
+
+    # Second step: request the same Mamba boundary again. The handoff is
+    # republished (the core may do this), but the CPU pool is full, so it
+    # should be dropped, not silently recovered from positional scan.
+    meta2 = sched.build_connector_meta(output)
+    assert meta2.store_event == -1
+    assert sched.boundary_store_stats.dropped_cpu_full >= 1
+    # No additional blocks should have been taken from the Mamba group by
+    # positional scanning; the dropped boundary stays dropped.
+    assert sched._reqs_to_store[req.request_id].num_stored_blocks[1] == 0

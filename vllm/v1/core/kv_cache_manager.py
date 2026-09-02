@@ -856,10 +856,10 @@ class KVCacheManager:
         Returns ``{request_id: [(group_id, block_id, boundary_tokens), ...]}``
         for the durable boundary blocks of producers' last-prompt-boundary
         partial tails. Mamba "align" groups contribute exact boundary-state
-        snapshots (including CoW targets for sub-block partial hits); DCP
-        full-attention groups contribute the request's own boundary block,
-        which is a durable source because KV below that boundary is
-        append-only. Empty otherwise.
+        snapshots (including CoW targets for sub-block partial hits);
+        fine-grained full-attention groups contribute the request's own
+        boundary block, which is a durable source because KV below that
+        boundary is append-only. Empty otherwise.
 
         A connector reads the referenced block IDs (without positional
         resolution) and offloads them so a later request can hit that

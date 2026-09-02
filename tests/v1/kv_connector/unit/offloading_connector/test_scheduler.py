@@ -118,7 +118,7 @@ def test_partial_tail_store_uses_attention_and_recurrent_cow_sources():
     output = SimpleNamespace(
         kv_connector_block_state=KVConnectorBlockState(
             block_ids={},
-            boundary_state_offloads={"req": [(1, 99, 28)]},
+            boundary_state_offloads={"req": [(0, 12, 28), (1, 99, 28)]},
         )
     )
     jobs = scheduler._build_partial_tail_store_jobs(output)
@@ -190,6 +190,39 @@ def test_aligned_boundary_store_uses_exact_source_with_partial_tail():
     assert src_spec.block_ids.tolist() == [98]
     assert src_spec.group_sizes == [0, 1]
     assert src_spec.block_indices == [0, 0]
+
+
+def test_dcp_ignores_unsupported_partial_attention_handoff():
+    vllm_config = _make_vllm_config(
+        tensor_parallel_size=2, decode_context_parallel_size=2
+    )
+    vllm_config.speculative_config = None
+    kv_cache_config = _make_mamba_hybrid_kv_cache_config()
+    spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
+    scheduler = OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
+    _make_partial_tail_request(scheduler)
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+
+    output = SimpleNamespace(
+        kv_connector_block_state=KVConnectorBlockState(
+            block_ids={},
+            boundary_state_offloads={
+                "req": [
+                    (0, 97, 16),  # Partial in the DCP-scaled attention block.
+                    (1, 98, 16),  # Aligned Mamba boundary.
+                ]
+            },
+        )
+    )
+    jobs = scheduler._build_partial_tail_store_jobs(output)
+
+    assert not scheduler.config.supports_partial_tail
+    assert len(jobs) == 1
+    [job] = jobs.values()
+    assert job.src_spec.block_ids.tolist() == [98]
+    assert job.src_spec.group_sizes == [0, 1]
 
 
 def test_aligned_boundary_store_flushes_before_cow_destination_reuse():

@@ -6,7 +6,6 @@ from collections import defaultdict
 from collections.abc import Sequence
 from typing import ClassVar
 
-from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
@@ -34,8 +33,6 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
 
-logger = init_logger(__name__)
-
 
 class SingleTypeKVCacheManager(ABC):
     """
@@ -44,7 +41,18 @@ class SingleTypeKVCacheManager(ABC):
     """
 
     supports_fine_grained_hash_lookup: ClassVar[bool] = False
-    has_positionally_stable_blocks: ClassVar[bool] = True
+
+    @property
+    def has_positionally_stable_blocks(self) -> bool:
+        """Whether historical block positions remain valid DMA sources.
+
+        Returns True if the manager never reuses an allocated block slot for a
+        different logical position while the request is in flight. Nulling
+        positions that have become irrelevant is still safe. Mamba "align"
+        mode reuses interior slots for relocated states and therefore returns
+        False.
+        """
+        return True
 
     def __init__(
         self,
@@ -398,7 +406,7 @@ class SingleTypeKVCacheManager(ABC):
 
         Entries are ``(req_id, group_id, block, boundary_tokens)``.
 
-        Mamba "align" and DCP full-attention producers can populate this.
+        Mamba "align" and fine-grained full-attention producers can populate this.
         The blocks are not guaranteed to stay reachable via request block
         tables for the whole request lifetime, so asynchronous callers must pin
         before reading.
@@ -1402,10 +1410,6 @@ class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
 
 class MambaManager(SingleTypeKVCacheManager):
     supports_fine_grained_hash_lookup: ClassVar[bool] = True
-    # Align-mode state blocks can be nulled, freed, or relocated in place.
-    # Connectors must consume exact same-step handoffs instead of retaining
-    # positional snapshots of the request block table.
-    has_positionally_stable_blocks: ClassVar[bool] = False
 
     def __init__(
         self, kv_cache_spec: MambaSpec, block_pool: BlockPool, **kwargs
@@ -1432,6 +1436,13 @@ class MambaManager(SingleTypeKVCacheManager):
             # connector; a request that finishes first hands off this table
             # source directly.
             self._producer_partial_tail_reqs: dict[str, tuple[KVCacheBlock, int]] = {}
+
+    @property
+    def has_positionally_stable_blocks(self) -> bool:
+        # Align-mode tables can null interior states and relocate speculative
+        # blocks. Other modes retain positional identity even when old prefixes
+        # are nulled after they become irrelevant.
+        return self.mamba_cache_mode != "align"
 
     @classmethod
     def find_longest_cache_hit(
@@ -1857,16 +1868,6 @@ class MambaManager(SingleTypeKVCacheManager):
             self.last_state_block_idx.pop(request_id, None)
             self._num_checkpoint_blocks.pop(request_id, None)
             self._producer_partial_tail_reqs.pop(request_id, None)
-            # An offer is only guaranteed to hold committed bytes until the end
-            # of the pass that made it. This request's blocks are going back to
-            # the pool now, so drop its not-yet-offered hand-offs rather than
-            # let a connector claim a block another request may already have
-            # been handed.
-            self._pending_boundary_state_offloads = [
-                entry
-                for entry in self._pending_boundary_state_offloads
-                if entry[0] != request_id
-            ]
         return super().pop_blocks_for_free(request_id)
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
