@@ -67,20 +67,23 @@ class StoreRequestState:
 
 class _StoreAdmission(Enum):
     READY = auto()
-    INVALID = auto()
+    NULL_BLOCK = auto()
+    NOT_HASHED = auto()
     IN_FLIGHT = auto()
     ALREADY_CACHED = auto()
-    CPU_FULL = auto()
 
 
 @dataclass
 class BoundaryStoreStats:
+    """Process-lifetime cumulative diagnostics for boundary handoffs."""
+
     published: int = 0
     stored: int = 0
     dropped_cpu_full: int = 0
     skipped_already_cached: int = 0
     skipped_in_flight: int = 0
-    dropped_invalid: int = 0
+    dropped_null_block: int = 0
+    dropped_not_hashed: int = 0
 
 
 class SimpleCPUOffloadScheduler:
@@ -534,15 +537,12 @@ class SimpleCPUOffloadScheduler:
 
         return gpu_ids, cpu_ids, []
 
-    def _classify_store_candidate(
-        self, gpu_block_id: int, num_free: int
-    ) -> _StoreAdmission:
-        gpu_block_pool = self._gpu_block_pool
-        assert gpu_block_pool is not None
-        gpu_block = gpu_block_pool.blocks[gpu_block_id]
-        if gpu_block.is_null or gpu_block.block_hash is None:
-            return _StoreAdmission.INVALID
-        if gpu_block_id in self._in_flight_store_gpu_blocks:
+    def _classify_store_candidate(self, gpu_block: "KVCacheBlock") -> _StoreAdmission:
+        if gpu_block.is_null:
+            return _StoreAdmission.NULL_BLOCK
+        if gpu_block.block_hash is None:
+            return _StoreAdmission.NOT_HASHED
+        if gpu_block.block_id in self._in_flight_store_gpu_blocks:
             return _StoreAdmission.IN_FLIGHT
         if (
             self.cpu_block_pool.cached_block_hash_to_block.get_one_block(
@@ -551,9 +551,11 @@ class SimpleCPUOffloadScheduler:
             is not None
         ):
             return _StoreAdmission.ALREADY_CACHED
-        if num_free <= 0:
-            return _StoreAdmission.CPU_FULL
         return _StoreAdmission.READY
+
+    def get_boundary_store_stats(self) -> BoundaryStoreStats:
+        """Return a snapshot of process-lifetime boundary handoff counters."""
+        return replace(self.boundary_store_stats)
 
     def _prepare_eager_store_specs(
         self, scheduler_output: SchedulerOutput
@@ -590,15 +592,18 @@ class SimpleCPUOffloadScheduler:
         boundary_offloads = (
             block_state.boundary_state_offloads if block_state is not None else {}
         )
+        stats = self.boundary_store_stats
         for req_id, entries in boundary_offloads.items():
             scheduled_for_req = False
             for _, gpu_block_id, _ in entries:
-                stats = self.boundary_store_stats
                 stats.published += 1
                 gpu_block = gpu_block_pool.blocks[gpu_block_id]
-                admission = self._classify_store_candidate(gpu_block_id, num_free)
-                if admission is _StoreAdmission.INVALID:
-                    stats.dropped_invalid += 1
+                admission = self._classify_store_candidate(gpu_block)
+                if admission is _StoreAdmission.NULL_BLOCK:
+                    stats.dropped_null_block += 1
+                    continue
+                if admission is _StoreAdmission.NOT_HASHED:
+                    stats.dropped_not_hashed += 1
                     continue
                 if admission is _StoreAdmission.IN_FLIGHT:
                     stats.skipped_in_flight += 1
@@ -606,7 +611,7 @@ class SimpleCPUOffloadScheduler:
                 if admission is _StoreAdmission.ALREADY_CACHED:
                     stats.skipped_already_cached += 1
                     continue
-                if admission is _StoreAdmission.CPU_FULL:
+                if num_free <= 0:
                     stats.dropped_cpu_full += 1
                     logger.warning_once(
                         "SimpleCPU dropped a boundary-state handoff because "
@@ -617,7 +622,9 @@ class SimpleCPUOffloadScheduler:
                 block_hash = gpu_block.block_hash
                 assert block_hash is not None
                 cpu_block = cpu_block_pool.get_new_blocks(1)[0]
-                cpu_block.set_block_hash(block_hash)
+                cpu_block.set_block_hash(
+                    block_hash, num_tokens=gpu_block.block_hash_num_tokens
+                )
                 merged_gpu_block_ids.append(gpu_block_id)
                 merged_cpu_block_ids.append(cpu_block.block_id)
                 in_flight.add(gpu_block_id)
@@ -627,11 +634,6 @@ class SimpleCPUOffloadScheduler:
                 scheduled_for_req = True
             if scheduled_for_req:
                 req_ids.append(req_id)
-
-        if boundary_offloads:
-            logger.debug(
-                "SimpleCPU boundary store stats: %s", self.boundary_store_stats
-            )
 
         for req_id, new_block_id_groups, preempted in yield_req_data(scheduler_output):
             state = self._reqs_to_store.get(req_id)
@@ -690,8 +692,12 @@ class SimpleCPUOffloadScheduler:
                 scannable = group_gpu_ids[already_stored_g:ready_blocks_g]
 
                 for gpu_block_id in scannable:
-                    admission = self._classify_store_candidate(gpu_block_id, num_free)
-                    if admission is _StoreAdmission.INVALID:
+                    gpu_block = gpu_block_pool.blocks[gpu_block_id]
+                    admission = self._classify_store_candidate(gpu_block)
+                    if admission in (
+                        _StoreAdmission.NULL_BLOCK,
+                        _StoreAdmission.NOT_HASHED,
+                    ):
                         # Masked-out SWA position the coordinator chose not to
                         # hash; it can never serve a prefix-cache hit, so skip.
                         advanced_per_group[g] += 1
@@ -702,10 +708,9 @@ class SimpleCPUOffloadScheduler:
                     ):
                         advanced_per_group[g] += 1
                         continue
-                    if admission is _StoreAdmission.CPU_FULL:
+                    if num_free <= 0:
                         out_of_space = True
                         break
-                    gpu_block = gpu_block_pool.blocks[gpu_block_id]
                     bhash_with_group = gpu_block.block_hash
                     assert bhash_with_group is not None
                     num_free -= 1

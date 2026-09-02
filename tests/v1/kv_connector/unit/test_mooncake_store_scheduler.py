@@ -1132,6 +1132,19 @@ def test_resumed_prefill_claims_boundaries_past_prompt_length():
     assert scheduler._pinned_saves[store_job_id][0] == [7, 9]
 
 
+def test_boundary_state_filters_non_mamba_group_entries():
+    scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
+    _register_offload_request(scheduler, prefill_end_tokens=16, num_prompt_tokens=16)
+    out = _make_offload_only_output([(0, 6, 12), (1, 7, 12)])
+
+    meta = scheduler.build_connector_meta(out)
+
+    assert len(meta.requests) == 1
+    assert meta.requests[0].boundary_state_offloads == [(1, 7, 12)]
+    store_job_id = meta.requests[0].store_job_id
+    assert scheduler._pinned_saves[store_job_id][0] == [7]
+
+
 def test_boundary_state_job_pins_exact_blocks_once():
     scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
     _register_offload_request(scheduler, prefill_end_tokens=64, num_prompt_tokens=64)
