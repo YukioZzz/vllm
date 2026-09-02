@@ -105,16 +105,6 @@ class SimpleCPUOffloadScheduler:
                 self.fa_gidx = g_idx
                 break
         assert 0 <= self.fa_gidx < len(self.cpu_kv_cache_config.kv_cache_groups)
-        # FA group's own block_size; divides scheduler_block_size (the LCM)
-        # but is NOT assumed to equal it.
-        self.fa_block_size: int = (
-            self.cpu_kv_cache_config.kv_cache_groups[
-                self.fa_gidx
-            ].kv_cache_spec.block_size
-            * self.cp_world_size
-        )
-        assert self.block_size % self.fa_block_size == 0
-
         logger.info(
             "SimpleCPUOffloadScheduler: Allocating %d offload blocks "
             "(%.2f GB, mode=%s, backend=%s)",
@@ -140,6 +130,11 @@ class SimpleCPUOffloadScheduler:
             scheduler_block_size=self.block_size,
             hash_block_size=self.hash_block_size,
         )
+        self.group_block_sizes = self.cpu_coordinator.group_block_sizes
+        # FA group's own resolved block_size; divides scheduler_block_size (the
+        # LCM) but is NOT assumed to equal it.
+        self.fa_block_size: int = self.group_block_sizes[self.fa_gidx]
+        assert self.block_size % self.fa_block_size == 0
         self.cpu_block_pool: BlockPool = self.cpu_coordinator.block_pool
         # GPU block pool reference - bound after scheduler builds kv_cache_manager
         self._gpu_block_pool: BlockPool | None = None
@@ -345,8 +340,6 @@ class SimpleCPUOffloadScheduler:
 
         # Build transfer pairs across all groups.
         total_computed_tokens = num_computed_tokens + num_external_tokens
-        kv_cache_groups = self.cpu_kv_cache_config.kv_cache_groups
-
         # The scheduler may have accepted fewer blocks than
         # get_num_new_matched_tokens() reported.
         # (e.g. due to token budget in test_partial_gpu_prefix_plus_cpu_load).
@@ -354,9 +347,7 @@ class SimpleCPUOffloadScheduler:
         # the rest will be released along with the temp pin below.
         cpu_hit_blocks: list[list[KVCacheBlock]] = []
         for g in range(num_groups):
-            g_block_size = (
-                kv_cache_groups[g].kv_cache_spec.block_size * self.cp_world_size
-            )
+            g_block_size = self.group_block_sizes[g]
             assert num_external_tokens % g_block_size == 0, (
                 f"num_external_tokens={num_external_tokens} not aligned to "
                 f"group {g} block_size={g_block_size}"
@@ -375,9 +366,7 @@ class SimpleCPUOffloadScheduler:
                 continue
 
             # Number of blocks in the computed range for this group.
-            g_block_size = (
-                kv_cache_groups[g].kv_cache_spec.block_size * self.cp_world_size
-            )
+            g_block_size = self.group_block_sizes[g]
             n_computed_g = cdiv(total_computed_tokens, g_block_size)
 
             # Back-trace: ext blocks sit at the tail of the computed range.
@@ -576,7 +565,7 @@ class SimpleCPUOffloadScheduler:
                 continue
 
             gpu_block_ids, advanced_per_group = self._select_eager_blocks_to_store(
-                state, block_ids_by_group
+                state, block_ids_by_group, num_new_tokens
             )
 
             # --- Phase 2: Batch allocate CPU blocks ---
@@ -615,14 +604,18 @@ class SimpleCPUOffloadScheduler:
         self,
         state: StoreRequestState,
         block_ids_by_group: tuple[list[int], ...],
+        num_new_tokens: int = 0,
     ) -> tuple[list[int], list[int]]:
         """Return confirmed, uncached eager blocks and per-group cursor advances."""
         assert self._gpu_block_pool is not None
         gpu_block_ids: list[int] = []
         advanced_per_group = [0] * len(self.cpu_kv_cache_config.kv_cache_groups)
         confirmed_tokens = (
-            state.request.num_computed_tokens - state.request.num_output_placeholders
+            state.request.num_computed_tokens
+            + num_new_tokens
+            - state.request.num_output_placeholders
         )
+        confirmed_tokens = max(0, min(confirmed_tokens, state.request.num_tokens))
         aligned_tokens = confirmed_tokens // self.block_size * self.block_size
         num_free = self.cpu_block_pool.get_num_free_blocks()
 
@@ -632,10 +625,7 @@ class SimpleCPUOffloadScheduler:
             # FIXME (yifan): handle CPU cache eviction, where
             # num_stored_blocks can be stale and omit evicted blocks in
             # the middle of the request.
-            group_size = (
-                self.cpu_kv_cache_config.kv_cache_groups[g].kv_cache_spec.block_size
-                * self.cp_world_size
-            )
+            group_size = self.group_block_sizes[g]
             ready = min(len(group_gpu_ids), aligned_tokens // group_size)
             for gpu_block_id in group_gpu_ids[state.num_stored_blocks[g] : ready]:
                 gpu_block = self._gpu_block_pool.blocks[gpu_block_id]

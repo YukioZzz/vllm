@@ -2001,7 +2001,10 @@ def test_cp_effective_block_size_store_and_load(
     req = _make_cp_request(num_blocks=2, virtual_block_size=vbs)
     gpu_blocks = _allocate_cp_gpu_blocks(gpu_pool, req, 2, vbs)
     kv = KVCacheBlocks(blocks=(gpu_blocks,))
-    req.num_computed_tokens = vbs
+    # build_connector_meta runs before the scheduler commits this step's
+    # scheduled tokens to the request, so current-step tokens come only from
+    # scheduler_output.num_scheduled_tokens here.
+    req.num_computed_tokens = 0
     sched.update_state_after_alloc(req, kv, num_external_tokens=0)
     m1 = sched.build_connector_meta(
         make_scheduler_output(
@@ -2016,7 +2019,7 @@ def test_cp_effective_block_size_store_and_load(
     # Load one DCP-scaled logical block from a two-block CPU hit.
     req2 = _make_cp_request(num_blocks=2, virtual_block_size=vbs)
     kv2 = KVCacheBlocks(blocks=(_allocate_cp_gpu_blocks(gpu_pool, req2, 2, vbs),))
-    req2.num_computed_tokens = 2 * vbs
+    req2.num_computed_tokens = 0
     sched.update_state_after_alloc(req2, kv2, num_external_tokens=0)
     m2 = sched.build_connector_meta(
         make_scheduler_output(
