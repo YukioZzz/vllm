@@ -44,10 +44,13 @@ class SingleTypeKVCacheManager(ABC):
 
     @property
     def has_positionally_stable_blocks(self) -> bool:
-        """Whether positional offload scans can safely follow this block table.
+        """Whether historical block positions remain valid DMA sources.
 
-        Nulling positions that have already become irrelevant is safe. Reusing
-        an interior position for a different token range is not.
+        Returns True if the manager never reuses an allocated block slot for a
+        different logical position while the request is in flight. Nulling
+        positions that have become irrelevant is still safe. Mamba "align"
+        mode reuses interior slots for relocated states and therefore returns
+        False.
         """
         return True
 

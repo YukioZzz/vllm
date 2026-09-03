@@ -75,7 +75,10 @@ class _StoreAdmission(Enum):
 
 @dataclass
 class BoundaryStoreStats:
-    """Process-lifetime cumulative diagnostics for boundary handoffs."""
+    """Process-lifetime cumulative diagnostics for boundary handoffs.
+
+    These counters are for operator/debug use only; they are not persisted.
+    """
 
     published: int = 0
     stored: int = 0
@@ -554,7 +557,11 @@ class SimpleCPUOffloadScheduler:
         return _StoreAdmission.READY
 
     def get_boundary_store_stats(self) -> BoundaryStoreStats:
-        """Return a snapshot of process-lifetime boundary handoff counters."""
+        """Return a snapshot of process-lifetime boundary handoff counters.
+
+        The counters are not reset during the process lifetime; callers should
+        subtract a baseline if they need a delta.
+        """
         return replace(self.boundary_store_stats)
 
     def _prepare_eager_store_specs(
