@@ -45,6 +45,8 @@ moriio_common = importlib.import_module(
     "vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common"
 )
 split_attn_mamba_block_ids = moriio_common.split_attn_mamba_block_ids
+as_attn_groups_mamba = moriio_common.as_attn_groups_mamba
+pack_attn_mamba_block_ids = moriio_common.pack_attn_mamba_block_ids
 
 
 class _FakeScheduler(moriio_connector.MoRIIOConnectorScheduler):  # type: ignore[name-defined]
@@ -69,6 +71,7 @@ class _FakeConnector(moriio_connector.MoRIIOConnector):  # type: ignore[name-def
 
 class _FakeWorker(moriio_connector.MoRIIOConnectorWorker):  # type: ignore[name-defined]
     def __init__(self, **attrs):
+        self._region_session_index = None
         for k, v in attrs.items():
             setattr(self, k, v)
 
@@ -149,16 +152,28 @@ def test_split_block_groups_ignores_transfer_disabled_group():
     assert sched.split_block_groups(([1, 2], [70, 71], [99])) == ([1, 2], [99])
 
 
-def test_scheduler_rejects_multiple_attention_groups():
-    config = SimpleNamespace(
-        kv_cache_groups=[
-            SimpleNamespace(enable_kv_transfer=True, kv_cache_spec=object()),
-            SimpleNamespace(enable_kv_transfer=True, kv_cache_spec=object()),
-        ]
+def test_split_block_groups_preserves_attention_groups():
+    sched = _FakeScheduler(
+        _has_mamba=True,
+        _attn_group_ids={0, 2},
+        _mamba_group_ids={1},
+        _ssm_spec_blocks=[None, 0, None],
     )
 
-    with pytest.raises(moriio_common.MoRIIOError, match="single attention"):
-        moriio_connector.MoRIIOConnectorScheduler(SimpleNamespace(), "engine", config)
+    attn_groups, mamba = sched.split_block_groups_grouped(([10, 11], [99], [20, 21]))
+    packed = pack_attn_mamba_block_ids(attn_groups, mamba)
+
+    assert attn_groups == [[10, 11], [20, 21]]
+    assert mamba == [99]
+    assert as_attn_groups_mamba(packed) == (attn_groups, mamba)
+
+
+def test_worker_selects_attention_blocks_by_layer_group():
+    worker = _FakeWorker(_layer_to_attn_group_pos={"target.0": 0, "target.1": 1})
+    packed = pack_attn_mamba_block_ids([[10, 11], [20, 21]], [99])
+
+    assert worker._select_attention_blocks_for_layer("target.0", packed) == [10, 11]
+    assert worker._select_attention_blocks_for_layer("target.1", packed) == [20, 21]
 
 
 def test_split_block_groups_no_mamba_reduces_to_prior_behavior():
@@ -278,6 +293,31 @@ def test_request_finished_all_groups_pure_attention_stays_flat():
     assert split_attn_mamba_block_ids(params["remote_block_ids"]) == ([7, 8], [])
 
 
+def test_request_finished_all_groups_preserves_multiple_attention_groups():
+    def _fake_request_finished(request, attn_block_ids, mamba_block_ids):
+        assert attn_block_ids == [10, 11, 20, 21]
+        assert mamba_block_ids == [42]
+        return True, {"remote_block_ids": attn_block_ids}
+
+    sched = _FakeScheduler(
+        _has_mamba=True,
+        _attn_group_ids={0, 1},
+        _mamba_group_ids={2},
+        _ssm_spec_blocks=[None, None, 0],
+    )
+    sched.request_finished = _fake_request_finished
+    conn = _FakeConnector(sched)
+
+    _, params = conn.request_finished_all_groups(
+        SimpleNamespace(request_id="r2"), ([10, 11], [20, 21], [42])
+    )
+
+    assert as_attn_groups_mamba(params["remote_block_ids"]) == (
+        [[10, 11], [20, 21]],
+        [42],
+    )
+
+
 def test_connector_supports_divergent_local_hybrid_hits():
     connector = _FakeConnector(None)
     connector.mode = MoRIIOMode.READ
@@ -329,6 +369,28 @@ def test_update_state_drops_decode_recompute_tail_block():
         [10, 11],
         [90, 91],
     ]
+
+
+def test_update_state_aligns_each_attention_group_independently():
+    sched = _make_read_scheduler()
+    sched._attn_group_ids = {0, 1}
+    sched._mamba_group_ids = {2}
+    sched._ssm_spec_blocks = [None, None, None]
+    request = _make_read_request(pack_attn_mamba_block_ids([[10, 11], [20, 21]], [90]))
+    blocks = _FakeBlocks(
+        all_groups=([100, 101, 102], [200, 201, 202], [300]),
+    )
+
+    sched.update_state_after_alloc(request, blocks, num_external_tokens=256)
+
+    assert as_attn_groups_mamba(sched._reqs_need_recv["req"][1]) == (
+        [[100, 101], [200, 201]],
+        [300],
+    )
+    assert as_attn_groups_mamba(sched._req_kv_params["req"]["remote_block_ids"]) == (
+        [[10, 11], [20, 21]],
+        [90],
+    )
 
 
 def test_update_state_pairs_shorter_local_blocks_with_remote_suffix():
@@ -445,6 +507,22 @@ def test_session_build_rejects_per_layer_region_count_mismatch():
     )
 
     with pytest.raises(moriio_common.MoRIIOError, match="registered 1 region"):
+        worker._get_built_session("prefill")
+
+
+def test_session_build_rejects_missing_non_draft_layer():
+    worker = _FakeWorker(
+        built_write_session={},
+        layer_name_to_local_kv_cache_metadata={
+            "target.0": ["local-target"],
+            "draft.0": ["local-draft"],
+        },
+        layer_name_to_remote_kv_cache_metadata={
+            "prefill": {"draft.0": ["remote-draft"]}
+        },
+    )
+
+    with pytest.raises(moriio_common.MoRIIOError, match="registered.*target.0"):
         worker._get_built_session("prefill")
 
 

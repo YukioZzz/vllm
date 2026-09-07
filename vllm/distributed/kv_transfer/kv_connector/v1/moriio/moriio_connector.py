@@ -40,16 +40,17 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     TransferError,
     TransferId,
     WriteTask,
+    as_attn_groups_mamba,
     fold_local_rank,
     get_moriio_mode,
     get_peer_zmq_from_request_id,
     get_port_offset,
     get_role,
+    pack_attn_mamba_block_ids,
     parse_moriio_zmq_address,
     pod_index,
     resolve_host_ip,
     set_role,
-    split_attn_mamba_block_ids,
     zmq_ctx,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_engine import (
@@ -330,9 +331,10 @@ class MoRIIOConnector(KVConnectorBase_V1, SupportsHMA):
         kv_transfer_params so the decoder can pull/receive the KDA state.
         """
         assert self.connector_scheduler is not None
-        attn_block_ids, mamba_block_ids = self.connector_scheduler.split_block_groups(
-            block_ids
+        attn_groups, mamba_block_ids = (
+            self.connector_scheduler.split_block_groups_grouped(block_ids)
         )
+        attn_block_ids = [block_id for group in attn_groups for block_id in group]
         # Drive the completion path with the attention blocks, but carry the
         # mamba/KDA recurrent-state slot in the SAME remote_block_ids channel
         # (as [attn, mamba]) rather than a separate wire field, so the
@@ -340,8 +342,10 @@ class MoRIIOConnector(KVConnectorBase_V1, SupportsHMA):
         delay_free, params = self.connector_scheduler.request_finished(
             request, attn_block_ids, mamba_block_ids
         )
-        if params is not None and mamba_block_ids:
-            params["remote_block_ids"] = [attn_block_ids, mamba_block_ids]
+        if params is not None and (mamba_block_ids or len(attn_groups) > 1):
+            params["remote_block_ids"] = pack_attn_mamba_block_ids(
+                attn_groups, mamba_block_ids
+            )
         return delay_free, params
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
@@ -435,10 +439,9 @@ def _split_kv_cache_group_kinds(
     mamba_group_indices) by whether each group's spec is a MambaSpec.
 
     Groups that opt out of external transfer (``enable_kv_transfer`` false) are
-    in neither list, so their blocks are dropped at every exchange point rather
-    than shipped as if they were attention. Indices stay relative to
-    ``kv_cache_groups`` because that is what the scheduler hands the connector.
-    Returns empty lists when kv_cache_config is None (e.g. worker side).
+    in neither list. Indices stay relative to ``kv_cache_groups`` because that
+    is what the scheduler hands the connector. Returns empty lists when
+    kv_cache_config is None (e.g. worker side).
     """
     attn: list[int] = []
     mamba: list[int] = []
@@ -470,15 +473,6 @@ class MoRIIOConnectorScheduler:
             kv_cache_config
         )
         self._has_mamba = bool(self._mamba_group_ids)
-        if len(self._attn_group_ids) > 1:
-            # Every attention layer would transfer using the same flattened
-            # list, so each layer's window would mostly belong to another
-            # group. A speculative drafter is the case that produces a second
-            # group; carrying the groups separately is a follow-up.
-            raise MoRIIOError(
-                "MoRIIO supports a single attention KV cache group, got "
-                f"{len(self._attn_group_ids)}"
-            )
         # Trailing scratch slots a mamba manager co-allocates per request for
         # speculative decoding, per kv cache group; None for non-mamba groups.
         self._ssm_spec_blocks: list[int | None] = []
@@ -845,12 +839,7 @@ class MoRIIOConnectorScheduler:
                     # remote_engine_id is returned by the prefill's request_finished.
                     # host/ports come from the request_id (parsed in add_new_req).
                     if "remote_engine_id" in params:
-                        # remote_block_ids carries [attn, mamba] (hybrid) or a
-                        # flat attn list; compare/trim on the attention half.
-                        remote_is_grouped = isinstance(
-                            remote_block_ids[0], (list, tuple)
-                        )
-                        remote_attn, remote_mamba = split_attn_mamba_block_ids(
+                        remote_attn_groups, remote_mamba = as_attn_groups_mamba(
                             remote_block_ids
                         )
                         adjusted_remote_block_ids = remote_block_ids
@@ -860,30 +849,37 @@ class MoRIIOConnectorScheduler:
                             # this hook runs. Use the complete local block table
                             # for both attention and recurrent state, then pair
                             # it with the remote list below.
-                            attn_block_ids, mamba_block_ids = self.split_block_groups(
-                                blocks.get_block_ids()
+                            local_attn_groups, mamba_block_ids = (
+                                self.split_block_groups_grouped(blocks.get_block_ids())
                             )
-                            local_attn = attn_block_ids
-                            if self._has_mamba:
-                                local_attn, remote_attn = self._align_read_blocks(
-                                    local_attn,
-                                    remote_attn,
+                            if len(local_attn_groups) != len(remote_attn_groups):
+                                raise MoRIIOError(
+                                    "Local and remote attention KV cache group "
+                                    "counts differ: "
+                                    f"{len(local_attn_groups)} != "
+                                    f"{len(remote_attn_groups)}"
+                                )
+                            aligned_local_groups: list[list[int]] = []
+                            aligned_remote_groups: list[list[int]] = []
+                            for local_group, remote_group in zip(
+                                local_attn_groups, remote_attn_groups
+                            ):
+                                local_group, remote_group = self._align_read_blocks(
+                                    local_group,
+                                    remote_group,
                                     self._max_decode_tail_blocks,
                                 )
+                                aligned_local_groups.append(local_group)
+                                aligned_remote_groups.append(remote_group)
+                            if self._has_mamba:
                                 mamba_block_ids, remote_mamba = self._align_read_blocks(
                                     mamba_block_ids, remote_mamba, 1
                                 )
-                            else:
-                                local_attn, remote_attn = self._align_read_blocks(
-                                    local_attn,
-                                    remote_attn,
-                                    self._max_decode_tail_blocks,
-                                )
-                            local_block_ids = [local_attn, mamba_block_ids]
-                            adjusted_remote_block_ids = (
-                                [remote_attn, remote_mamba]
-                                if remote_is_grouped
-                                else remote_attn
+                            local_block_ids = pack_attn_mamba_block_ids(
+                                aligned_local_groups, mamba_block_ids
+                            )
+                            adjusted_remote_block_ids = pack_attn_mamba_block_ids(
+                                aligned_remote_groups, remote_mamba
                             )
                         else:
                             # Attention needs no pull (full prefix-cache hit, or
@@ -894,11 +890,11 @@ class MoRIIOConnectorScheduler:
                             # attention half; only a pure-attention model (no mamba
                             # group) collapses to []. _read_blocks still notifies P
                             # to free memory.
-                            _, mamba_block_ids = self.split_block_groups(
-                                blocks.get_block_ids()
+                            local_attn_groups, mamba_block_ids = (
+                                self.split_block_groups_grouped(blocks.get_block_ids())
                             )
-                            local_block_ids = (
-                                [[], mamba_block_ids] if mamba_block_ids else []
+                            local_block_ids = pack_attn_mamba_block_ids(
+                                [[] for _ in local_attn_groups], mamba_block_ids
                             )
 
                         self._reqs_need_recv[request.request_id] = (
@@ -1147,23 +1143,32 @@ class MoRIIOConnectorScheduler:
         and the worker has to guess which slot is live. Mirrors
         ``NixlConnectorScheduler.get_exchange_clipped_blocks``.
         """
-        if not self._has_mamba:
-            if getattr(self, "kv_cache_config", None) is not None:
-                attn = []
-                for gi, group in enumerate(block_ids):
-                    if gi in self._attn_group_ids:
-                        attn.extend(group)
-                return attn, []
+        attn_groups, mamba = self.split_block_groups_grouped(block_ids)
+        return [block_id for group in attn_groups for block_id in group], mamba
+
+    def split_block_groups_grouped(
+        self, block_ids: list[list[int]] | tuple[list[int], ...]
+    ) -> tuple[list[list[int]], list[int]]:
+        """Split block IDs without flattening distinct attention groups."""
+        if not self._has_mamba and getattr(self, "kv_cache_config", None) is None:
             first = block_ids[0] if block_ids else []
-            return list(first), []
-        attn: list[int] = []
+            return [list(first)], []
+        attn_groups: list[list[int]] = []
         mamba: list[int] = []
         for gi, group in enumerate(block_ids):
             if gi in self._mamba_group_ids:
                 mamba.extend(self._clip_mamba_group(gi, list(group)))
             elif gi in self._attn_group_ids:
-                attn.extend(group)
-        return attn, mamba
+                attn_groups.append(list(group))
+        if not attn_groups:
+            attn_groups.append([])
+        return attn_groups, mamba
+
+    def pack_block_groups(
+        self, block_ids: list[list[int]] | tuple[list[int], ...]
+    ) -> list:
+        attn_groups, mamba = self.split_block_groups_grouped(block_ids)
+        return pack_attn_mamba_block_ids(attn_groups, mamba)
 
     def _clip_mamba_group(self, group_index: int, blocks: list[int]) -> list[int]:
         """Keep only the state-bearing slots of one mamba kv cache group."""
@@ -1434,6 +1439,14 @@ class MoRIIOConnectorWorker:
         self.kv_transfer_config = vllm_config.kv_transfer_config
         self.is_producer = self.kv_transfer_config.is_kv_producer
         self.layer_to_spec = build_layer_to_spec(kv_cache_config)
+        self._attn_group_ids, self._mamba_group_ids = _split_kv_cache_group_kinds(
+            kv_cache_config
+        )
+        self._layer_to_attn_group_pos: dict[str, int] = {}
+        for group_pos, group_id in enumerate(self._attn_group_ids):
+            group = kv_cache_config.kv_cache_groups[group_id]
+            for layer_name in group.layer_names:
+                self._layer_to_attn_group_pos[layer_name] = group_pos
 
         if self.is_producer:
             set_role(ROLE.PRODUCER)
@@ -1543,7 +1556,6 @@ class MoRIIOConnectorWorker:
         self.kv_element_size = 0
         self.kv_cache_shapes: dict[str, torch.Size] = {}
         self.block_lens: dict[str, int] = {}
-
         # Map of engine_id -> {agent_name0, agent_name1..}.
         self._remote_agents: dict[EngineId, set[str]] = {}
 
@@ -1699,10 +1711,16 @@ class MoRIIOConnectorWorker:
         self._writer.schedule_write(task)
 
     def _get_built_session(self, remote_engine_id):
+        remote_layer_map = self.layer_name_to_remote_kv_cache_metadata[remote_engine_id]
+        missing_remote_layers = (
+            self.layer_name_to_local_kv_cache_metadata.keys() - remote_layer_map.keys()
+        )
+        if missing_remote_layers:
+            raise MoRIIOError(
+                "Remote engine is missing registered KV cache layer(s): "
+                f"{sorted(missing_remote_layers)}"
+            )
         if remote_engine_id not in self.built_write_session:
-            remote_layer_map = self.layer_name_to_remote_kv_cache_metadata[
-                remote_engine_id
-            ]
             cur_remote_engine_sessions = []
             for ln, local_metas in self.layer_name_to_local_kv_cache_metadata.items():
                 remote_metas = remote_layer_map[ln]
@@ -2263,11 +2281,6 @@ class MoRIIOConnectorWorker:
                     base_addr_idx += 1
                 continue
             geometry = self._get_layer_transfer_geometry(layer_name)
-            if geometry.block_size != self.block_size:
-                raise ValueError(
-                    "MoRIIO KV cache block size mismatch for layer "
-                    f"{layer_name}: {geometry.block_size} != {self.block_size}"
-                )
             self.block_lens[layer_name] = geometry.block_len
             for cache, region_len in self._iter_layer_registration_regions(layer_name):
                 base_addr = cache.data_ptr()
@@ -3189,6 +3202,27 @@ class MoRIIOConnectorWorker:
             remote = [x + remote_off for x in remote]
         return local, remote, sizes
 
+    def _select_attention_blocks_for_layer(
+        self,
+        layer_name: str,
+        block_ids: list,
+    ) -> list[int]:
+        attn_groups, _ = as_attn_groups_mamba(block_ids)
+        if len(attn_groups) == 1:
+            return list(attn_groups[0])
+        group_pos = self._layer_to_attn_group_pos.get(layer_name)
+        if group_pos is None:
+            raise MoRIIOError(
+                f"Attention layer {layer_name} is not present in the local "
+                "KV-cache group mapping"
+            )
+        if group_pos >= len(attn_groups):
+            raise MoRIIOError(
+                f"Attention layer {layer_name} maps to group {group_pos}, but "
+                f"the block-id payload carries only {len(attn_groups)} group(s)"
+            )
+        return list(attn_groups[group_pos])
+
     def _region_session_indices(self, layer_name: str) -> list[int]:
         """Flat session indices for a layer's registered regions.
 
@@ -3370,9 +3404,14 @@ class MoRIIOConnectorWorker:
         if self.mode == MoRIIOMode.WRITE:
             return
 
-        # Both halves ride the one block-ids channel; split at the point of use.
-        local_attn, local_mamba = split_attn_mamba_block_ids(local_block_ids)
-        remote_attn, remote_mamba = split_attn_mamba_block_ids(remote_block_ids)
+        # Both halves ride the one block-ids channel. Keep attention groups
+        # separate so each layer uses the block table of its own cache group.
+        local_attn_groups, local_mamba = as_attn_groups_mamba(local_block_ids)
+        remote_attn_groups, remote_mamba = as_attn_groups_mamba(remote_block_ids)
+        local_attn_all = [block_id for group in local_attn_groups for block_id in group]
+        remote_attn_all = [
+            block_id for group in remote_attn_groups for block_id in group
+        ]
 
         # Read from the prefill rank that actually computed this request's KV
         # (forwarded by the proxy). Hardcoding DP0 reads from a different rank's
@@ -3409,7 +3448,7 @@ class MoRIIOConnectorWorker:
                 # KDA layer: pull conv (sub-projection offsets) and ssm at the
                 # request's recurrent-state slot. Two regions -> two sessions.
                 if not local_mamba or not remote_mamba:
-                    if not local_attn and not remote_attn:
+                    if not local_attn_all and not remote_attn_all:
                         # Whole-request no-op (e.g. full prefix cache hit):
                         # nothing to transfer for any layer.
                         continue
@@ -3434,6 +3473,14 @@ class MoRIIOConnectorWorker:
                     _sq_deadline,
                 )
             else:
+                local_attn = self._select_attention_blocks_for_layer(
+                    layer_name, local_block_ids
+                )
+                remote_attn = self._select_attention_blocks_for_layer(
+                    layer_name, remote_block_ids
+                )
+                if not local_attn or not remote_attn:
+                    continue
                 offs = self._compute_block_transfer_offsets(
                     layer_name,
                     local_attn,
@@ -3457,7 +3504,7 @@ class MoRIIOConnectorWorker:
                 self._recving_transfers[request_id][layer_name] = statuses
                 self._recving_transfers_start.setdefault(request_id, time.monotonic())
                 # Destination blocks, kept for _record_failed_recv.
-                self._recving_local_blocks.setdefault(request_id, list(local_attn))
+                self._recving_local_blocks.setdefault(request_id, local_attn_all)
                 # Awaited before the forward when the per-layer barrier cannot
                 # run (see _await_reads_issued_this_step).
                 self._reads_issued_this_step.extend(statuses)

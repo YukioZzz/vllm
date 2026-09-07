@@ -43,6 +43,39 @@ EngineId = str
 ReqId = str
 TransferId = str
 TransferOffsetsKey = tuple[str, tuple[int, ...], tuple[int, ...], torch.dtype]
+MORIIO_GROUPED_BLOCK_IDS = "__moriio_grouped_block_ids_v1__"
+
+
+def pack_attn_mamba_block_ids(
+    attn_groups: list[list[int]],
+    mamba_block_ids: list[int] | None = None,
+) -> list:
+    """Pack grouped attention and mamba IDs into the block-id channel."""
+    groups = [list(group) for group in attn_groups]
+    mamba = list(mamba_block_ids or [])
+    if len(groups) > 1:
+        return [MORIIO_GROUPED_BLOCK_IDS, groups, mamba]
+    attn = groups[0] if groups else []
+    return [attn, mamba] if mamba else attn
+
+
+def as_attn_groups_mamba(
+    block_ids: list[int] | list[list[int]] | tuple[list[int], ...] | None,
+) -> tuple[list[list[int]], list[int]]:
+    """Unpack block IDs while retaining each attention cache group."""
+    if not block_ids:
+        return [[]], []
+    if block_ids[0] == MORIIO_GROUPED_BLOCK_IDS:
+        packed = cast(list, block_ids)
+        groups = [list(group) for group in packed[1]]
+        mamba = list(packed[2]) if len(packed) > 2 else []
+        return groups, mamba
+    if isinstance(block_ids[0], (list, tuple)):
+        grouped = cast(list[list[int]] | tuple[list[int], ...], block_ids)
+        attn = list(grouped[0])
+        mamba = list(grouped[1]) if len(grouped) > 1 else []
+        return [attn], mamba
+    return [list(cast(list[int], block_ids))], []
 
 
 def _positive_finite_timeout(name: str, value: Any) -> float:
@@ -70,14 +103,8 @@ def split_attn_mamba_block_ids(
     ``(that_list, [])``. Consumers on the worker/engine side split at the
     point of use rather than threading a parallel mamba field through.
     """
-    if not block_ids:
-        return [], []
-    if isinstance(block_ids[0], (list, tuple)):
-        grouped = cast(list[list[int]] | tuple[list[int], ...], block_ids)
-        attn = list(grouped[0])
-        mamba = list(grouped[1]) if len(grouped) > 1 else []
-        return attn, mamba
-    return list(cast(list[int], block_ids)), []
+    attn_groups, mamba = as_attn_groups_mamba(block_ids)
+    return [block_id for group in attn_groups for block_id in group], mamba
 
 
 @dataclass
