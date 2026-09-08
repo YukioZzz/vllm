@@ -191,6 +191,38 @@ def test_allocate_compressed_mla_cache(
     assert caches["layer.0"].shape == (expected_num_blocks, 1, expected_num_states, 128)
 
 
+def test_allocate_rocm_kv_cache_has_page_aligned_shared_base(monkeypatch):
+    spec = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.uint8,
+    )
+    raw_size = 3 * spec.page_size_bytes + 17
+    config = KVCacheConfig(
+        num_blocks=3,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=raw_size,
+                layers=["layer.0"],
+                layer_stride=3 * spec.page_size_bytes,
+                block_stride=spec.page_size_bytes,
+            )
+        ],
+        kv_cache_groups=[KVCacheGroupSpec(["layer.0"], spec)],
+    )
+
+    monkeypatch.setattr("vllm.v1.worker.utils.current_platform.is_rocm", lambda: True)
+    monkeypatch.setattr(
+        "vllm.v1.worker.utils.warmup_rocm_skinny_gemm_workspaces", lambda _device: None
+    )
+    caches = allocate_kv_cache(config, torch.device("cpu"), KVCacheLayout.LBHNC)
+
+    cache = caches["layer.0"]
+    assert cache.data_ptr() % 4096 == 0
+    assert cache.untyped_storage().nbytes() >= raw_size + 4095
+
+
 @pytest.mark.parametrize("layout", list(KVCacheLayout))
 def test_copy_kv_cache_blocks_shared_storage(layout: KVCacheLayout):
     num_blocks = 4
