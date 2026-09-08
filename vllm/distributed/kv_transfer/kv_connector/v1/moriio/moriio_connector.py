@@ -1559,6 +1559,7 @@ class MoRIIOConnectorWorker:
         # KV Caches and moriio tracking data.
         self.kv_caches: dict[str, torch.Tensor] = {}
         self.kv_layer_mr_offset: dict[str, int] = {}
+        self.kv_region_mr_offsets: dict[str, list[int]] = {}
         self.layer_base_addr_index: dict[str, int] = {}
 
         # Map of engine_id -> kv_caches_base_addr. For TP case, each local
@@ -2117,25 +2118,38 @@ class MoRIIOConnectorWorker:
         self, kv_caches: dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor, dict[str, int]]:
         page_size = 4096
-        backing = next(iter(kv_caches.values())).view(torch.uint8)
-        nbytes = backing.untyped_storage().nbytes()
-        base = torch.as_strided(backing, (nbytes,), (1,), 0)
-        ptr = base.data_ptr()
-        slack = ptr % page_size
-        end = 0
+        backing = min(kv_caches.values(), key=lambda cache: cache.data_ptr()).view(
+            torch.uint8
+        )
+        ptr = backing.data_ptr()
+        end = ptr
         for layer_name in kv_caches:
-            _, region_len = next(
-                iter(self._iter_layer_registration_regions(layer_name))
+            for cache, region_len in self._iter_layer_registration_regions(layer_name):
+                end = max(end, cache.data_ptr() + region_len)
+        # ibv_reg_mr requires the base address to be page aligned, but accepts
+        # an arbitrary byte length. Rounding the end up can exceed storage by
+        # one page when a packed KDA region reaches the last allocated byte.
+        reg_nbytes = end - ptr
+        storage_offset = backing.storage_offset()
+        available = backing.untyped_storage().nbytes() - storage_offset
+        if ptr % page_size:
+            raise ValueError(
+                f"shared KV backing is not {page_size}-byte aligned: 0x{ptr:x}"
             )
-            end = max(end, kv_caches[layer_name].data_ptr() - ptr + region_len)
-        reg_nbytes = ((slack + end + page_size - 1) // page_size) * page_size
-        if reg_nbytes > nbytes:
+        if reg_nbytes > available:
             raise ValueError(
                 f"shared KV backing too small for page-aligned MR: "
-                f"need {reg_nbytes}, have {nbytes}"
+                f"need {reg_nbytes}, have {available}"
             )
-        reg = torch.as_strided(base, (reg_nbytes,), (1,), 0 if slack == 0 else -slack)
+        reg = torch.as_strided(backing, (reg_nbytes,), (1,), storage_offset)
         mr_ptr = reg.data_ptr()
+        logger.info(
+            "MoRIIO shared KV MR: base=0x%x size=%d page_aligned=%s layers=%d",
+            mr_ptr,
+            reg_nbytes,
+            mr_ptr % page_size == 0,
+            len(kv_caches),
+        )
         return reg, {
             name: cache.data_ptr() - mr_ptr for name, cache in kv_caches.items()
         }
@@ -2280,9 +2294,11 @@ class MoRIIOConnectorWorker:
             and len({id(t.untyped_storage()) for t in kv_caches.values()}) == 1
         )
         shared_mr = None
+        shared_mr_base = None
         if shared_backing:
             reg_tensor, self.kv_layer_mr_offset = self._build_shared_kv_mr(kv_caches)
             shared_mr = self.moriio_wrapper.register_local_tensor(reg_tensor)
+            shared_mr_base = reg_tensor.data_ptr()
 
         # Say it out loud when the groups disagree. This is expected on a hybrid
         # model and used to be fatal, so a run that silently had one page size
@@ -2326,11 +2342,17 @@ class MoRIIOConnectorWorker:
                     ssm.is_contiguous(),
                     ssm.untyped_storage().nbytes(),
                 )
+                self.kv_region_mr_offsets[layer_name] = []
                 for tensor in (conv, ssm):
                     alias = self._contiguous_byte_alias(tensor)
-                    meta = self.moriio_wrapper.register_local_tensor(alias)
+                    meta = shared_mr or self.moriio_wrapper.register_local_tensor(alias)
                     self.layer_name_to_local_kv_cache_metadata[layer_name].append(meta)
                     self.local_kv_cache_size.append(alias.numel())
+                    self.kv_region_mr_offsets[layer_name].append(
+                        0
+                        if shared_mr_base is None
+                        else alias.data_ptr() - shared_mr_base
+                    )
             else:
                 moriio_mem_metadata = shared_mr or (
                     self.moriio_wrapper.register_local_tensor(kv_cache)
@@ -3261,6 +3283,8 @@ class MoRIIOConnectorWorker:
         local_slots: list[int],
         remote_slots: list[int],
         remote_tp_size: int,
+        remote_moriio_meta: MoRIIOAgentMetadata,
+        remote_engine_id: EngineId,
         request_id: str,
         deadline: float,
     ) -> list:
@@ -3276,10 +3300,22 @@ class MoRIIOConnectorWorker:
             remote_slots,
             remote_tp_size=remote_tp_size,
         )
+        local_region_offsets = self.kv_region_mr_offsets.get(layer_name, [0, 0])
+        remote_metas = self.layer_name_to_remote_kv_cache_metadata[remote_engine_id][
+            layer_name
+        ]
+        base_idx = self.layer_base_addr_index[layer_name]
+        remote_region_offsets = [
+            remote_moriio_meta.kv_caches_base_addr[base_idx + i]
+            - self.moriio_wrapper.get_unpack_memory_metadata(meta).data
+            for i, meta in enumerate(remote_metas)
+        ]
         statuses: list = []
-        for sess_idx, sl in (
-            (region_sessions[0], slice(0, n_conv)),
-            (region_sessions[1], slice(n_conv, None)),
+        for region_idx, (sess_idx, sl) in enumerate(
+            (
+                (region_sessions[0], slice(0, n_conv)),
+                (region_sessions[1], slice(n_conv, None)),
+            )
         ):
             region_sizes = sizes[sl]
             if not region_sizes:
@@ -3288,8 +3324,11 @@ class MoRIIOConnectorWorker:
                 self._post_read_with_backoff(
                     sessions[sess_idx],
                     region_sizes,
-                    local[sl],
-                    remote[sl],
+                    [offset + local_region_offsets[region_idx] for offset in local[sl]],
+                    [
+                        offset + remote_region_offsets[region_idx]
+                        for offset in remote[sl]
+                    ],
                     request_id,
                     layer_name,
                     deadline,
@@ -3430,6 +3469,8 @@ class MoRIIOConnectorWorker:
                     local_mamba,
                     remote_mamba,
                     remote_tp_size,
+                    remote_moriio_meta,
+                    remote_dp_engine_id,
                     request_id,
                     _sq_deadline,
                 )
