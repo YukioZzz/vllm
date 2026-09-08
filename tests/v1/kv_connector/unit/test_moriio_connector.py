@@ -3,6 +3,7 @@
 import importlib.util
 import socket
 import uuid
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import msgspec
@@ -931,3 +932,44 @@ def test_worker_layer_to_group_routing(mock_parallel_groups):
             kv_cache_config=_make_hybrid_kv_cache_config(),
         )
     assert worker.layer_to_group == {"full0": 0, "sw0": 1}
+def test_mamba_reads_apply_shared_mr_region_offsets():
+    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker.kv_region_mr_offsets = {"kda": [100, 200]}
+    worker.layer_base_addr_index = {"kda": 3}
+    worker.layer_name_to_remote_kv_cache_metadata = {
+        "remote": {"kda": ["conv-meta", "ssm-meta"]}
+    }
+    worker.moriio_wrapper = MagicMock()
+    worker.moriio_wrapper.get_unpack_memory_metadata.side_effect = [
+        SimpleNamespace(data=1000),
+        SimpleNamespace(data=2000),
+    ]
+    worker._compute_mamba_transfer_offsets = MagicMock(
+        return_value=([10, 20], [30, 40], [4, 8], 1)
+    )
+    worker._post_read_with_backoff = MagicMock(side_effect=["conv", "ssm"])
+
+    statuses = worker._post_mamba_reads(
+        "kda",
+        [None] * 7,
+        [5, 6],
+        [1],
+        [2],
+        8,
+        SimpleNamespace(kv_caches_base_addr=[0, 0, 0, 1010, 2020]),
+        "remote",
+        "request",
+        123.0,
+    )
+
+    assert statuses == ["conv", "ssm"]
+    assert worker._post_read_with_backoff.call_args_list[0].args[1:4] == (
+        [4],
+        [110],
+        [40],
+    )
+    assert worker._post_read_with_backoff.call_args_list[1].args[1:4] == (
+        [8],
+        [220],
+        [60],
+    )
