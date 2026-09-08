@@ -379,7 +379,7 @@ def test_update_state_aligns_attention_only_decode_tail():
         num_external_tokens=256,
     )
 
-    assert sched._reqs_need_recv["req"][1] == [[100, 101], []]
+    assert sched._reqs_need_recv["req"][1] == [100, 101]
     assert sched._req_kv_params["req"]["remote_block_ids"] == [10, 11]
 
 

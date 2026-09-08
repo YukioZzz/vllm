@@ -327,6 +327,53 @@ def test_read_completion_sends_structured_release_with_consumer_tp_size():
     assert worker._recving_transfers_callback_addr == {}
 
 
+def test_aborted_read_without_local_blocks_only_releases_remote_blocks():
+    class FakeWrapper:
+        def __init__(self):
+            self.sent = []
+
+        def send_notify(
+            self,
+            transfer_id,
+            host,
+            port,
+            message_type=None,
+            message_fields=None,
+        ):
+            self.sent.append((transfer_id, host, port, message_type, message_fields))
+
+        def shutdown(self):
+            pass
+
+    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker.mode = MoRIIOMode.READ
+    worker.world_size = 8
+    worker.moriio_wrapper = FakeWrapper()
+
+    worker._read_blocks(
+        local_block_ids=[],
+        remote_block_ids=[[10, 11], [90]],
+        dst_engine_id="prefill",
+        request_id="req-aborted",
+        transfer_id="tx-aborted",
+        remote_host="127.0.0.1",
+        remote_notify_port=7000,
+        remote_tp_size=8,
+        remote_dp_rank=0,
+        chosen_tp=2,
+    )
+
+    assert worker.moriio_wrapper.sent == [
+        (
+            "tx-aborted",
+            "127.0.0.1",
+            "7002",
+            "release",
+            {"consumer_tp_size": 8},
+        )
+    ]
+
+
 def test_read_completion_waits_for_every_posted_read():
     class Status:
         def __init__(self, done: bool):

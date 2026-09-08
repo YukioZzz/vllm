@@ -3428,6 +3428,26 @@ class MoRIIOConnectorWorker:
             if chosen_tp is not None
             else self._remote_tp_rank(remote_tp_size)
         )
+        if not local_attn and not local_mamba:
+            # A request aborted before decode allocation still carries the
+            # producer's remote block table so every consumer TP rank can
+            # release it. There is no local destination and no forward in this
+            # scheduler step, so acknowledge without posting any RDMA reads.
+            self.moriio_wrapper.send_notify(
+                transfer_id,
+                remote_host,
+                str(
+                    remote_notify_port
+                    + get_port_offset(
+                        int(remote_dp_rank),
+                        eff_tp,
+                        remote_tp_size,
+                    )
+                ),
+                message_type="release",
+                message_fields={"consumer_tp_size": self.world_size},
+            )
+            return
         if flexible:
             remote_dp_engine_id = self.get_engine_name_with_dp_tp(
                 dst_engine_id, int(remote_dp_rank), eff_tp
