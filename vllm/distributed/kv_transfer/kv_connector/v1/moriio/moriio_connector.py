@@ -879,7 +879,11 @@ class MoRIIOConnectorScheduler:
                                     remote_attn,
                                     self._max_decode_tail_blocks,
                                 )
-                            local_block_ids = [local_attn, mamba_block_ids]
+                            local_block_ids = (
+                                [local_attn, mamba_block_ids]
+                                if self._has_mamba
+                                else local_attn
+                            )
                             adjusted_remote_block_ids = (
                                 [remote_attn, remote_mamba]
                                 if remote_is_grouped
