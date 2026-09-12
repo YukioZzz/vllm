@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+import os
 from collections.abc import Mapping
 from typing import Any
 
@@ -103,6 +104,15 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
+        self.context_only = (
+            self._speculator_name == "DSpark"
+            and os.environ.get("VLLM_DSPARK_CONTEXT_ONLY", "0") == "1"
+        )
+        if self.context_only:
+            logger.info(
+                "DSpark context-only producer mode: draft context KV will be "
+                "materialized without generating draft proposals"
+            )
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
@@ -115,6 +125,9 @@ class DFlashSpeculator(DraftModelSpeculator):
         return config
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+        if self.context_only:
+            self.query_cudagraph_manager = None
+            return
         wants_full = cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
         supports_full = (
             self.attn_cg_support.min_cg_support.value
@@ -141,6 +154,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
 
     def capture(self) -> None:
+        if self.context_only:
+            return
         logger.info("Capturing model for %s speculator...", self._speculator_name)
         # Padded sample rows must not scatter into a live request during capture.
         self.sample_indices.zero_()
@@ -375,6 +390,8 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.hidden_states[:num_target_tokens],
                 self.context_positions[:num_target_tokens],
             )
+            if self.context_only:
+                return self.draft_tokens[:num_reqs, :0]
             # DFlash processes all speculative tokens in one forward pass,
             # so the real token count is num_query_tokens.
             self._prepare_eplb_forward(num_query_tokens)
@@ -442,6 +459,8 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.context_positions[:num_target_tokens],
             context_slots,
         )
+        if self.context_only:
+            return self.draft_tokens[:num_reqs, :0]
 
         batch_sync, num_batch_tokens = (
             self._build_uniform_batch_dp_sync(dp_sync, num_reqs, self.num_query_per_req)

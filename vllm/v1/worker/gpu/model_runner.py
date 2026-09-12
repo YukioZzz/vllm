@@ -2006,6 +2006,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.query_start_loc,
         )
 
+        draft_tokens = None
         if self.speculator is not None:
             assert self.sampler is not None
             # Let the target override the hidden state fed to the drafter
@@ -2032,8 +2033,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     dp_sync=dp_sync,
                     mm_inputs=mm_inputs,
                 )
-            self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
-            if self.adaptive_verification is not None:
+            if draft_tokens.shape[1] > 0:
+                self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+            if self.adaptive_verification is not None and draft_tokens.shape[1] > 0:
                 self.adaptive_verification.record_confidences(
                     self.speculator.draft_token_confidence_probs, input_batch
                 )
@@ -2041,11 +2043,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
-            self.draft_tokens_handler.set_draft_tokens(
-                input_batch,
-                self.req_states.draft_tokens[input_batch.idx_mapping],
+            output_draft_tokens = (
+                draft_tokens
+                if draft_tokens is not None and draft_tokens.shape[1] == 0
+                else self.req_states.draft_tokens[input_batch.idx_mapping]
             )
-            if self.pp_handler is not None:
+            self.draft_tokens_handler.set_draft_tokens(input_batch, output_draft_tokens)
+            if self.pp_handler is not None and output_draft_tokens.shape[1] > 0:
                 self.pp_handler.broadcast_drafts(
                     self.req_states.draft_tokens, input_batch
                 )
