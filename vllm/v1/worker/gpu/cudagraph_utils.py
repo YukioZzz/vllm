@@ -388,6 +388,9 @@ class CudaGraphManager:
 
                     # Warmup
                     forward_fn(CUDAGraphMode.NONE)
+                    if trace_memory:
+                        torch.accelerator.synchronize()
+                        torch.accelerator.empty_cache()
 
                     # Capture
                     logger.debug(
