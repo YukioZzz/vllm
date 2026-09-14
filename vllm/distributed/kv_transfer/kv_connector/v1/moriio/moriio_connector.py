@@ -2,12 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
 import math
+import os
 import queue
 import threading
 import time
 from collections import defaultdict
 from collections.abc import Collection
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 import msgpack
@@ -102,6 +104,15 @@ logger = init_logger(__name__)
 # wait only needs to be long enough for it to make progress.
 _SQ_FULL_BACKOFF_INITIAL_S = 0.001
 _SQ_FULL_BACKOFF_MAX_S = 0.05
+
+
+@dataclass
+class _MoRIIOPerfWindow:
+    calls: int = 0
+    seconds: float = 0.0
+    max_seconds: float = 0.0
+    items: int = 0
+    nbytes: int = 0
 
 
 try:
@@ -1449,6 +1460,18 @@ class MoRIIOConnectorWorker:
         self.tp_rank = self.moriio_config.tp_rank
         self.dp_rank = self.moriio_config.dp_rank
 
+        self._perf_trace_enabled = (
+            os.environ.get("MORIIO_PERF_TRACE", "0").lower() in {"1", "true", "yes"}
+            and self._rank == 0
+        )
+        self._perf_trace_interval = max(
+            float(os.environ.get("MORIIO_PERF_TRACE_INTERVAL", "10")), 1.0
+        )
+        self._perf_trace_last = time.monotonic()
+        self._perf_trace_lock = threading.Lock()
+        self._perf_trace_stats: dict[str, _MoRIIOPerfWindow] = {}
+        self._perf_request_bytes: defaultdict[ReqId, int] = defaultdict(int)
+
         self.local_ip = self.moriio_config.local_ip
         self.local_kv_port = self.moriio_config.local_kv_port
         self.proxy_ip = self.moriio_config.proxy_ip
@@ -1623,6 +1646,7 @@ class MoRIIOConnectorWorker:
         self.cache_config = vllm_config.cache_config
 
         self.block_window_per_layer: list[int | None] = []
+
         self.use_mla = self.model_config.use_mla
         # Hybrid (mamba/KDA) recurrent-state transfer. Populated in
         # register_kv_caches when the model has a MambaSpec kv_cache group.
@@ -1654,6 +1678,49 @@ class MoRIIOConnectorWorker:
         # TODO: consider the integration of flashinfer or other backends.
         self.backend_name = backend.get_name()
         logger.debug("Detected attention backend %s", self.backend_name)
+
+    def _record_perf_trace(
+        self,
+        phase: str,
+        seconds: float,
+        *,
+        items: int = 0,
+        nbytes: int = 0,
+    ) -> None:
+        if not self._perf_trace_enabled:
+            return
+
+        now = time.monotonic()
+        with self._perf_trace_lock:
+            stats = self._perf_trace_stats.setdefault(phase, _MoRIIOPerfWindow())
+            stats.calls += 1
+            stats.seconds += seconds
+            stats.max_seconds = max(stats.max_seconds, seconds)
+            stats.items += items
+            stats.nbytes += nbytes
+            if now - self._perf_trace_last < self._perf_trace_interval:
+                return
+            window_seconds = now - self._perf_trace_last
+            snapshot = self._perf_trace_stats
+            self._perf_trace_stats = {}
+            self._perf_trace_last = now
+
+        for name, values in sorted(snapshot.items()):
+            avg_ms = values.seconds * 1000 / max(values.calls, 1)
+            gbps = values.nbytes / max(values.seconds, 1e-9) / 1e9
+            logger.info(
+                "[MORIIO-PERF] role=%s phase=%s window_s=%.1f calls=%d "
+                "avg_ms=%.3f max_ms=%.3f items=%d bytes=%d effective_gbps=%.3f",
+                "producer" if self.is_producer else "consumer",
+                name,
+                window_seconds,
+                values.calls,
+                avg_ms,
+                values.max_seconds * 1000,
+                values.items,
+                values.nbytes,
+                gbps,
+            )
 
     def schedule_write_blocks(
         self,
@@ -2541,6 +2608,7 @@ class MoRIIOConnectorWorker:
         if not pending:
             return
 
+        started = time.perf_counter()
         try:
             self.moriio_wrapper.waiting_for_transfer_complete(pending)
         except TransferError:
@@ -2556,6 +2624,12 @@ class MoRIIOConnectorWorker:
                 "to transfer cleanup.",
                 layer_name,
                 exc_info=True,
+            )
+        finally:
+            self._record_perf_trace(
+                "layer_barrier",
+                time.perf_counter() - started,
+                items=len(pending),
             )
 
     def _pop_done_transfers(self) -> set[str]:
@@ -2574,6 +2648,14 @@ class MoRIIOConnectorWorker:
                 ]
                 state = self.moriio_wrapper.poll_transfer_batch(statuses)
                 if statuses and state is TransferBatchState.DONE:
+                    started = self._recving_transfers_start.get(req_id)
+                    if started is not None:
+                        self._record_perf_trace(
+                            "request_read_lifetime",
+                            time.monotonic() - started,
+                            items=len(statuses),
+                            nbytes=self._perf_request_bytes.get(req_id, 0),
+                        )
                     host, port, xfer_id = self._recving_transfers_callback_addr[req_id]
                     done_req_ids.add(xfer_id)
                     self.moriio_wrapper.send_notify(
@@ -2636,6 +2718,7 @@ class MoRIIOConnectorWorker:
                 del self._recving_transfers_callback_addr[req_id]
                 self._recving_transfers_start.pop(req_id, None)
                 self._recving_local_blocks.pop(req_id, None)
+                self._perf_request_bytes.pop(req_id, None)
 
             return done_req_ids
 
@@ -2671,6 +2754,7 @@ class MoRIIOConnectorWorker:
             statuses = mamba_statuses
         if not statuses:
             return
+        started = time.perf_counter()
         try:
             self.moriio_wrapper.waiting_for_transfer_complete(statuses)
         except TransferError:
@@ -2683,6 +2767,12 @@ class MoRIIOConnectorWorker:
             logger.exception(
                 "MoRIIO reads did not complete before the forward; proceeding "
                 "to transfer cleanup."
+            )
+        finally:
+            self._record_perf_trace(
+                "step_barrier",
+                time.perf_counter() - started,
+                items=len(statuses),
             )
 
     def _record_failed_recv(self, req_id: ReqId) -> None:
@@ -3358,6 +3448,9 @@ class MoRIIOConnectorWorker:
         transfer_timeout, then store the failed status (get_finished notifies
         prefill and drops the request non-fatally).
         """
+        started = time.perf_counter()
+        payload_bytes = sum(sizes)
+        retries = 0
         _backoff = _SQ_FULL_BACKOFF_INITIAL_S
         while True:
             transfer_status = self.moriio_wrapper.read_remote_data(
@@ -3365,6 +3458,7 @@ class MoRIIOConnectorWorker:
             )
             if not self._is_sq_full_status(transfer_status):
                 break
+            retries += 1
             if time.monotonic() > deadline:
                 logger.warning(
                     "MoRIIO READ send queue stayed full past "
@@ -3377,6 +3471,17 @@ class MoRIIOConnectorWorker:
                 break
             time.sleep(_backoff)
             _backoff = min(_backoff * 2, _SQ_FULL_BACKOFF_MAX_S)
+        elapsed = time.perf_counter() - started
+        if self._perf_trace_enabled:
+            self._perf_request_bytes[request_id] += payload_bytes
+        self._record_perf_trace(
+            "read_post",
+            elapsed,
+            items=len(sizes),
+            nbytes=payload_bytes,
+        )
+        if retries:
+            self._record_perf_trace("sq_retry", elapsed, items=retries)
         return transfer_status
 
     @staticmethod
