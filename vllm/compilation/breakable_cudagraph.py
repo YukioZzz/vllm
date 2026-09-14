@@ -371,13 +371,11 @@ class BreakableCUDAGraphWrapper:
         else:
             set_graph_pool_id(current_platform.graph_pool_handle())
 
-        # Match torch.cuda.graph()'s pre-capture cleanup, which we bypass.
-        # Skip it when gc is disabled: bulk capture runs under
-        # freeze_gc_for_cudagraph_capture, which already did this cleanup,
-        # and repeating it per descriptor dominates capture time.
-        if gc.isenabled():
-            gc.collect()
-            torch.accelerator.empty_cache()
+        # Match torch.cuda.graph()'s pre-capture cleanup once per descriptor.
+        # This is intentionally explicit because breakable capture drives
+        # capture_begin/end directly and bypasses torch.cuda.graph().
+        gc.collect()
+        torch.accelerator.empty_cache()
         # Sync the offloader's copy stream before capture so any in-flight
         # pre-capture prefetches are complete and don't leak into the graph.
         get_offloader().sync_prev_onload()
