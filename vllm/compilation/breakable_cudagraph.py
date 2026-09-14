@@ -22,6 +22,7 @@ capture so subsequent graph segments read the same memory addresses.
 
 from __future__ import annotations
 
+import ctypes
 import dataclasses
 import functools
 import gc
@@ -55,6 +56,156 @@ def is_breakable_cudagraph_enabled() -> bool:
 
 
 F = TypeVar("F", bound=Callable[..., Any])
+
+
+@functools.cache
+def _hip_graph_exec_update_fn() -> Any:
+    update = ctypes.CDLL("libamdhip64.so").hipGraphExecUpdate
+    update.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    update.restype = ctypes.c_int
+    return update
+
+
+@functools.cache
+def _hip_get_last_error_fn() -> Any:
+    get_last_error = ctypes.CDLL("libamdhip64.so").hipGetLastError
+    get_last_error.argtypes = []
+    get_last_error.restype = ctypes.c_int
+    return get_last_error
+
+
+@functools.cache
+def _hip_graph_instantiate_fn() -> Any:
+    instantiate = ctypes.CDLL("libamdhip64.so").hipGraphInstantiateWithFlags
+    instantiate.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p,
+        ctypes.c_ulonglong,
+    ]
+    instantiate.restype = ctypes.c_int
+    return instantiate
+
+
+@functools.cache
+def _hip_graph_exec_destroy_fn() -> Any:
+    destroy = ctypes.CDLL("libamdhip64.so").hipGraphExecDestroy
+    destroy.argtypes = [ctypes.c_void_p]
+    destroy.restype = ctypes.c_int
+    return destroy
+
+
+def _try_hip_graph_exec_update(
+    graph_exec: int,
+    raw_graph: int,
+) -> tuple[bool, int, int]:
+    error_node = ctypes.c_void_p()
+    update_result = ctypes.c_int(-1)
+    status = _hip_graph_exec_update_fn()(
+        ctypes.c_void_p(graph_exec),
+        ctypes.c_void_p(raw_graph),
+        ctypes.byref(error_node),
+        ctypes.byref(update_result),
+    )
+    if status != 0 or update_result.value != 0:
+        # HIP leaves graph-update failures in the per-thread last-error slot.
+        _hip_get_last_error_fn()()
+        return False, status, update_result.value
+    return True, status, update_result.value
+
+
+class _SharedHIPGraphExec:
+    """One HIP graph executable shared by compatible raw graph variants."""
+
+    def __init__(self, graph: torch.cuda.CUDAGraph) -> None:
+        graph.instantiate()
+        self.graph = graph
+        self.canonical_raw_graph = graph.raw_cuda_graph()
+        self.current_raw_graph = self.canonical_raw_graph
+
+    def try_update(self, graph: torch.cuda.CUDAGraph) -> tuple[bool, int, int]:
+        return _try_hip_graph_exec_update(
+            self.graph.raw_cuda_graph_exec(),
+            graph.raw_cuda_graph(),
+        )
+
+    def compatibility_with(self, graph: torch.cuda.CUDAGraph) -> tuple[bool, str]:
+        """Check both update directions without mutating the live executable."""
+        scratch_exec = ctypes.c_void_p()
+        instantiate_status = _hip_graph_instantiate_fn()(
+            ctypes.byref(scratch_exec),
+            ctypes.c_void_p(self.canonical_raw_graph),
+            0,
+        )
+        if instantiate_status != 0:
+            _hip_get_last_error_fn()()
+            raise RuntimeError(
+                "hipGraphInstantiateWithFlags failed for compatibility probe: "
+                f"status={instantiate_status}"
+            )
+
+        try:
+            forward = _try_hip_graph_exec_update(
+                scratch_exec.value,
+                graph.raw_cuda_graph(),
+            )
+            if not forward[0]:
+                return False, f"forward_status={forward[1]},result={forward[2]}"
+            reverse = _try_hip_graph_exec_update(
+                scratch_exec.value,
+                self.canonical_raw_graph,
+            )
+            if not reverse[0]:
+                return False, f"reverse_status={reverse[1]},result={reverse[2]}"
+            return True, ""
+        finally:
+            destroy_status = _hip_graph_exec_destroy_fn()(scratch_exec)
+            if destroy_status != 0:
+                _hip_get_last_error_fn()()
+                raise RuntimeError(
+                    "hipGraphExecDestroy failed for compatibility probe: "
+                    f"status={destroy_status}"
+                )
+
+    def replay(self, graph: torch.cuda.CUDAGraph) -> None:
+        raw_graph = graph.raw_cuda_graph()
+        if self.current_raw_graph not in {self.canonical_raw_graph, raw_graph}:
+            success, status, update_result = _try_hip_graph_exec_update(
+                self.graph.raw_cuda_graph_exec(),
+                self.canonical_raw_graph,
+            )
+            if not success:
+                raise RuntimeError(
+                    "hipGraphExecUpdate failed to restore the canonical graph: "
+                    f"status={status}, update_result={update_result}"
+                )
+            self.current_raw_graph = self.canonical_raw_graph
+        if self.current_raw_graph != raw_graph:
+            success, status, update_result = self.try_update(graph)
+            if not success:
+                raise RuntimeError(
+                    "hipGraphExecUpdate failed from the canonical graph: "
+                    f"status={status}, update_result={update_result}"
+                )
+            self.current_raw_graph = raw_graph
+        self.graph.replay()
+
+
+class _SharedHIPGraphReplay:
+    def __init__(
+        self,
+        shared_exec: _SharedHIPGraphExec,
+        graph: torch.cuda.CUDAGraph,
+    ) -> None:
+        self.shared_exec = shared_exec
+        self.graph = graph
+
+    def __call__(self) -> None:
+        self.shared_exec.replay(self.graph)
 
 
 def eager_break_during_capture(fn: F) -> F:
@@ -151,11 +302,20 @@ class BreakableCUDAGraphCapture:
     def is_active(cls) -> bool:
         return cls.current() is not None
 
-    def __init__(self, pool: Any | None = None) -> None:
+    def __init__(
+        self,
+        pool: Any | None = None,
+        graph_exec_templates: list[list[_SharedHIPGraphExec]] | None = None,
+    ) -> None:
         self.pool = pool
+        self.graph_exec_templates = graph_exec_templates
         self.segments: list[Callable[[], Any]] = []
+        self.graphs: list[torch.cuda.CUDAGraph] = []
         self._num_graphs: int = 0
         self._num_eager_breaks: int = 0
+        self._num_new_graph_execs: int = 0
+        self._num_reused_graph_execs: int = 0
+        self.graph_update_failures: dict[str, int] = {}
         self.eager_break_sources: dict[str, int] = {}
         self._current_graph: torch.cuda.CUDAGraph | None = None
         self._capturing: bool = False
@@ -179,7 +339,10 @@ class BreakableCUDAGraphCapture:
 
     def _begin_segment(self) -> None:
         assert not self._capturing
-        g = torch.cuda.CUDAGraph()
+        if self.graph_exec_templates is None:
+            g = torch.cuda.CUDAGraph()
+        else:
+            g = torch.cuda.CUDAGraph(keep_graph=True)
         if self.pool is not None:
             g.capture_begin(pool=self.pool)
         else:
@@ -192,7 +355,31 @@ class BreakableCUDAGraphCapture:
             return
         assert self._current_graph is not None
         self._current_graph.capture_end()
-        self.segments.append(self._current_graph.replay)
+        graph = self._current_graph
+        if self.graph_exec_templates is None:
+            self.segments.append(graph.replay)
+        else:
+            graph_index = self._num_graphs
+            if graph_index == len(self.graph_exec_templates):
+                self.graph_exec_templates.append([])
+            templates = self.graph_exec_templates[graph_index]
+            shared_exec = None
+            for candidate in templates:
+                success, failure = candidate.compatibility_with(graph)
+                if success:
+                    shared_exec = candidate
+                    break
+                self.graph_update_failures[failure] = (
+                    self.graph_update_failures.get(failure, 0) + 1
+                )
+            if shared_exec is None:
+                shared_exec = _SharedHIPGraphExec(graph)
+                templates.append(shared_exec)
+                self._num_new_graph_execs += 1
+            else:
+                self._num_reused_graph_execs += 1
+            self.graphs.append(graph)
+            self.segments.append(_SharedHIPGraphReplay(shared_exec, graph))
         self._num_graphs += 1
         self._current_graph = None
         self._capturing = False
@@ -287,6 +474,8 @@ class BreakableCUDAGraphWrapper:
         self.compilation_config = vllm_config.compilation_config
         self.graph_pool = current_platform.get_global_graph_pool()
         self.is_debugging_mode = envs.VLLM_LOGGING_LEVEL == "DEBUG"
+        self.reuse_hip_graph_execs = torch.version.hip is not None
+        self.graph_exec_templates: list[list[_SharedHIPGraphExec]] = []
 
         self.entries: dict[BatchDescriptor, _BreakableEntry] = {}
         BreakableCUDAGraphWrapper._all_instances.add(self)
@@ -310,6 +499,7 @@ class BreakableCUDAGraphWrapper:
 
     def clear_graphs(self) -> None:
         self.entries.clear()
+        self.graph_exec_templates.clear()
 
     # --- dispatch --------------------------------------------------------
 
@@ -389,7 +579,12 @@ class BreakableCUDAGraphWrapper:
             allocated_before = torch.cuda.memory_allocated()
             reserved_before = torch.cuda.memory_reserved()
 
-        capture = BreakableCUDAGraphCapture(pool=self.graph_pool)
+        capture = BreakableCUDAGraphCapture(
+            pool=self.graph_pool,
+            graph_exec_templates=(
+                self.graph_exec_templates if self.reuse_hip_graph_execs else None
+            ),
+        )
         with capture:
             output = self.runnable(*args, **kwargs)
             # Join the offloader's copy stream while we still hold the last
@@ -411,7 +606,9 @@ class BreakableCUDAGraphWrapper:
                 "BREAKABLE_CUDAGRAPH_MEMORY descriptor=%s segments=%d "
                 "eager_breaks=%d delta_mib=%.2f free_before_gib=%.3f "
                 "free_after_gib=%.3f allocated_delta_mib=%.2f "
-                "reserved_delta_mib=%.2f pool=%r eager_break_sources=%s",
+                "reserved_delta_mib=%.2f pool=%r new_execs=%d reused_execs=%d "
+                "total_exec_templates=%d graph_update_failures=%s "
+                "eager_break_sources=%s",
                 entry.batch_descriptor,
                 capture.num_graphs,
                 capture.num_eager_breaks,
@@ -421,6 +618,10 @@ class BreakableCUDAGraphWrapper:
                 (allocated_after - allocated_before) / (1 << 20),
                 (reserved_after - reserved_before) / (1 << 20),
                 self.graph_pool,
+                capture._num_new_graph_execs,
+                capture._num_reused_graph_execs,
+                sum(len(templates) for templates in self.graph_exec_templates),
+                capture.graph_update_failures,
                 capture.eager_break_sources,
             )
 
