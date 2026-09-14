@@ -51,6 +51,25 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+class _MemoryTracePoint(NamedTuple):
+    free: int
+    allocated: int
+    reserved: int
+
+
+def _memory_trace_point() -> _MemoryTracePoint:
+    torch.accelerator.synchronize()
+    return _MemoryTracePoint(
+        free=torch.accelerator.get_memory_info()[0],
+        allocated=torch.cuda.memory_allocated(),
+        reserved=torch.cuda.memory_reserved(),
+    )
+
+
+def _memory_delta_mib(before: int, after: int) -> float:
+    return (before - after) / (1 << 20)
+
+
 class AttentionState(NamedTuple):
     attn_metadata: dict[str, Any] | None
     slot_mappings: dict[str, torch.Tensor]
@@ -378,16 +397,22 @@ class CudaGraphManager:
                     descs = descs[: self._max_full_descs_to_capture]
                 trace_memory = os.getenv("VLLM_MEMORY_PHASE_TRACE", "0") == "1"
                 if trace_memory:
-                    torch.accelerator.synchronize()
-                    phase_free_before = torch.accelerator.get_memory_info()[0]
+                    phase_before = _memory_trace_point()
                 if is_global_first_rank():
                     descs = tqdm(descs, desc=f"{progress_bar_desc} ({mode.name})")
                 for desc in descs:
+                    trace_descriptor = trace_memory and is_global_first_rank()
+                    if trace_descriptor:
+                        descriptor_start = _memory_trace_point()
                     # Prepare inputs and get forward function
                     forward_fn = create_forward_fn(desc, warmup=True)
+                    if trace_descriptor:
+                        warmup_prepared = _memory_trace_point()
 
                     # Warmup
                     forward_fn(CUDAGraphMode.NONE)
+                    if trace_descriptor:
+                        warmup_finished = _memory_trace_point()
 
                     # Capture
                     logger.debug(
@@ -401,8 +426,55 @@ class CudaGraphManager:
                     else:
                         # Capture with fresh attention state.
                         forward_fn = create_forward_fn(desc, warmup=False)
+                        if trace_descriptor:
+                            capture_prepared = _memory_trace_point()
                         if desc.cg_mode == CUDAGraphMode.PIECEWISE:
                             forward_fn(CUDAGraphMode.PIECEWISE)
+                            if trace_descriptor:
+                                capture_finished = _memory_trace_point()
+                                logger.info(
+                                    "CUDAGRAPH_DESCRIPTOR_LIFECYCLE "
+                                    "descriptor=%s mode=%s "
+                                    "prepare_warmup_driver_mib=%.2f "
+                                    "warmup_driver_mib=%.2f "
+                                    "prepare_capture_driver_mib=%.2f "
+                                    "capture_driver_mib=%.2f "
+                                    "total_driver_mib=%.2f "
+                                    "allocated_delta_mib=%.2f "
+                                    "reserved_delta_mib=%.2f",
+                                    desc,
+                                    mode.name,
+                                    _memory_delta_mib(
+                                        descriptor_start.free,
+                                        warmup_prepared.free,
+                                    ),
+                                    _memory_delta_mib(
+                                        warmup_prepared.free,
+                                        warmup_finished.free,
+                                    ),
+                                    _memory_delta_mib(
+                                        warmup_finished.free,
+                                        capture_prepared.free,
+                                    ),
+                                    _memory_delta_mib(
+                                        capture_prepared.free,
+                                        capture_finished.free,
+                                    ),
+                                    _memory_delta_mib(
+                                        descriptor_start.free,
+                                        capture_finished.free,
+                                    ),
+                                    (
+                                        capture_finished.allocated
+                                        - descriptor_start.allocated
+                                    )
+                                    / (1 << 20),
+                                    (
+                                        capture_finished.reserved
+                                        - descriptor_start.reserved
+                                    )
+                                    / (1 << 20),
+                                )
                             continue
                         assert desc not in self.graphs, (
                             f"Graph already captured for {desc}"
@@ -434,17 +506,19 @@ class CudaGraphManager:
                         self.graphs[desc] = graph
                         compilation_counter.num_cudagraph_captured += 1
                 if trace_memory:
-                    torch.accelerator.synchronize()
-                    phase_free_after = torch.accelerator.get_memory_info()[0]
+                    phase_after = _memory_trace_point()
                     logger.info(
                         "CUDAGRAPH_MEMORY_PHASE name=%s mode=%s graphs=%d "
-                        "delta_gib=%.3f free_before_gib=%.3f free_after_gib=%.3f",
+                        "delta_gib=%.3f free_before_gib=%.3f free_after_gib=%.3f "
+                        "allocated_delta_gib=%.3f reserved_delta_gib=%.3f",
                         progress_bar_desc,
                         mode.name,
                         len(descs),
-                        (phase_free_before - phase_free_after) / (1 << 30),
-                        phase_free_before / (1 << 30),
-                        phase_free_after / (1 << 30),
+                        (phase_before.free - phase_after.free) / (1 << 30),
+                        phase_before.free / (1 << 30),
+                        phase_after.free / (1 << 30),
+                        (phase_after.allocated - phase_before.allocated) / (1 << 30),
+                        (phase_after.reserved - phase_before.reserved) / (1 << 30),
                     )
         self._graphs_captured = True
 

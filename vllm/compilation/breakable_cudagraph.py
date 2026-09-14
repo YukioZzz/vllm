@@ -386,6 +386,8 @@ class BreakableCUDAGraphWrapper:
         if trace_memory:
             torch.accelerator.synchronize()
             free_before = torch.accelerator.get_memory_info()[0]
+            allocated_before = torch.cuda.memory_allocated()
+            reserved_before = torch.cuda.memory_reserved()
 
         capture = BreakableCUDAGraphCapture(pool=self.graph_pool)
         with capture:
@@ -403,16 +405,22 @@ class BreakableCUDAGraphWrapper:
         if trace_memory:
             torch.accelerator.synchronize()
             free_after = torch.accelerator.get_memory_info()[0]
+            allocated_after = torch.cuda.memory_allocated()
+            reserved_after = torch.cuda.memory_reserved()
             logger.info(
                 "BREAKABLE_CUDAGRAPH_MEMORY descriptor=%s segments=%d "
                 "eager_breaks=%d delta_mib=%.2f free_before_gib=%.3f "
-                "free_after_gib=%.3f eager_break_sources=%s",
+                "free_after_gib=%.3f allocated_delta_mib=%.2f "
+                "reserved_delta_mib=%.2f pool=%r eager_break_sources=%s",
                 entry.batch_descriptor,
                 capture.num_graphs,
                 capture.num_eager_breaks,
                 (free_before - free_after) / (1 << 20),
                 free_before / (1 << 30),
                 free_after / (1 << 30),
+                (allocated_after - allocated_before) / (1 << 20),
+                (reserved_after - reserved_before) / (1 << 20),
+                self.graph_pool,
                 capture.eager_break_sources,
             )
 
