@@ -232,7 +232,7 @@ def test_fp8_prefill_metadata_width_matches_forward(num_heads: int) -> None:
 
     from vllm.v1.attention.backends.mla.rocm_aiter_mla import _FP8_PREFILL_TILE_Q
 
-    def _tiles(nhk: int) -> int:
+    def _legacy_tiles(nhk: int) -> int:
         return get_ps_metadata_info_v1(
             batch_size=1,
             num_head_k=nhk,
@@ -241,4 +241,25 @@ def test_fp8_prefill_metadata_width_matches_forward(num_heads: int) -> None:
         )[5][0]
 
     _, _, builder = _build_prefill_metadata([512], torch.device("cuda"), num_heads)
-    assert builder.fp8_ps_reduce_partial_map.numel() == _tiles(width)
+    assert builder.fp8_ps_reduce_partial_map.numel() <= _legacy_tiles(width)
+
+
+def test_fp8_prefill_sizing_respects_total_token_budget() -> None:
+    from vllm.v1.attention.backends.mla.rocm_aiter_mla import (
+        _tighten_fp8_prefill_ps_sizes,
+    )
+
+    sizes = _tighten_fp8_prefill_ps_sizes(
+        max_num_reqs=80,
+        max_prefill_qlen=16384,
+        max_num_batched_tokens=16384,
+        num_head_k=16,
+        qlen_granularity=16,
+        num_cus=256,
+        work_info_size=(1_556_480, 8),
+        reduce_indptr_size=81_921,
+        reduce_final_map_size=(81_920, 2),
+        reduce_partial_map_size=30_720,
+    )
+
+    assert sizes == ((17_888, 8), 1_104, (1_103, 2), 30)

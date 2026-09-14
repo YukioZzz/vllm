@@ -3,6 +3,7 @@
 
 import functools
 import inspect
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,6 +41,47 @@ from vllm.v1.attention.ops.rocm_aiter_mla_merge import (
 from vllm.v1.kv_cache_interface import AttentionSpec, is_quantized_kv_cache
 
 logger = init_logger(__name__)
+
+
+def _tighten_fp8_prefill_ps_sizes(
+    *,
+    max_num_reqs: int,
+    max_prefill_qlen: int,
+    max_num_batched_tokens: int,
+    num_head_k: int,
+    qlen_granularity: int,
+    num_cus: int,
+    work_info_size: tuple[int, int],
+    reduce_indptr_size: int,
+    reduce_final_map_size: tuple[int, int],
+    reduce_partial_map_size: int,
+) -> tuple[tuple[int, int], int, tuple[int, int], int]:
+    """Tighten AITER's independent batch/sequence bounds using total tokens.
+
+    The metadata generator concatenates query tiles before splitting their KV
+    work over thread groups. Therefore a legal scheduler batch has at most
+    ``ceil(total_q / granularity) + batch - 1`` query tiles, and at most two
+    partial outputs per boundary between thread groups. AITER's generic sizing
+    helper assumes every request can simultaneously have ``max_prefill_qlen``
+    query tokens, which is impossible when vLLM also caps total batch tokens.
+    """
+    max_uniform_tiles = max_num_reqs * cdiv(max_prefill_qlen, qlen_granularity)
+    max_total_tiles = cdiv(max_num_batched_tokens, qlen_granularity) + max_num_reqs - 1
+    max_query_tiles = min(max_uniform_tiles, max_total_tiles)
+
+    num_clusters = math.gcd(num_head_k, num_cus)
+    tgs_per_cluster = num_cus // num_clusters
+    tight_work_rows = (max_query_tiles + tgs_per_cluster - 1) * num_head_k
+    tight_partial_tiles = min(
+        max_query_tiles + tgs_per_cluster - 1,
+        2 * (tgs_per_cluster - 1),
+    )
+    return (
+        (min(work_info_size[0], tight_work_rows), work_info_size[1]),
+        min(reduce_indptr_size, max_query_tiles + 1),
+        (min(reduce_final_map_size[0], max_query_tiles), reduce_final_map_size[1]),
+        min(reduce_partial_map_size, tight_partial_tiles),
+    )
 
 
 def _segmented_mla_page_size(block_size: int) -> int:
@@ -731,6 +773,23 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             num_head_k=num_head_k,
             max_qlen=max_prefill_qlen,
             qlen_granularity=qlen_granularity,
+        )
+        (
+            work_info_size,
+            reduce_indptr_size,
+            reduce_final_map_size,
+            reduce_partial_map_size,
+        ) = _tighten_fp8_prefill_ps_sizes(
+            max_num_reqs=max_num_reqs,
+            max_prefill_qlen=max_prefill_qlen,
+            max_num_batched_tokens=max_num_batched_tokens,
+            num_head_k=num_head_k,
+            qlen_granularity=qlen_granularity,
+            num_cus=torch.cuda.get_device_properties(device).multi_processor_count,
+            work_info_size=work_info_size,
+            reduce_indptr_size=reduce_indptr_size,
+            reduce_final_map_size=reduce_final_map_size,
+            reduce_partial_map_size=reduce_partial_map_size,
         )
 
         self.fp8_ps_work_metadata = torch.empty(
