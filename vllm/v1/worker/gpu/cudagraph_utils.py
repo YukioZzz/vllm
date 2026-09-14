@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
 import itertools
+import os
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -375,6 +376,10 @@ class CudaGraphManager:
                     # graphs; the total cost is extrapolated from their
                     # per-graph memory deltas.
                     descs = descs[: self._max_full_descs_to_capture]
+                trace_memory = os.getenv("VLLM_MEMORY_PHASE_TRACE", "0") == "1"
+                if trace_memory:
+                    torch.accelerator.synchronize()
+                    phase_free_before = torch.accelerator.get_memory_info()[0]
                 if is_global_first_rank():
                     descs = tqdm(descs, desc=f"{progress_bar_desc} ({mode.name})")
                 for desc in descs:
@@ -428,6 +433,19 @@ class CudaGraphManager:
                             self._capture_mem_samples.append(free_before - free_after)
                         self.graphs[desc] = graph
                         compilation_counter.num_cudagraph_captured += 1
+                if trace_memory:
+                    torch.accelerator.synchronize()
+                    phase_free_after = torch.accelerator.get_memory_info()[0]
+                    logger.info(
+                        "CUDAGRAPH_MEMORY_PHASE name=%s mode=%s graphs=%d "
+                        "delta_gib=%.3f free_before_gib=%.3f free_after_gib=%.3f",
+                        progress_bar_desc,
+                        mode.name,
+                        len(descs),
+                        (phase_free_before - phase_free_after) / (1 << 30),
+                        phase_free_before / (1 << 30),
+                        phase_free_after / (1 << 30),
+                    )
         self._graphs_captured = True
 
     def captured_token_counts(self) -> list[int]:

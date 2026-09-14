@@ -19,6 +19,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from contextlib import AbstractContextManager
 from copy import deepcopy
@@ -782,6 +783,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             remove_lora=True,
             num_active_loras=max_loras,
         ):
+            trace_memory = (
+                is_profile and os.getenv("VLLM_MEMORY_PHASE_TRACE", "0") == "1"
+            )
+            if trace_memory:
+                torch.accelerator.synchronize()
+                free_before_target = torch.accelerator.get_memory_info()[0]
+
             # Execute the model.
             self.execute_model(
                 dummy_scheduler_output,
@@ -792,6 +800,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 context_len=context_len,
                 valid_dummy_state_slots=valid_dummy_state_slots,
             )
+            if trace_memory:
+                torch.accelerator.synchronize()
+                free_after_target = torch.accelerator.get_memory_info()[0]
+                logger.info(
+                    "ACTIVATION_MEMORY_PHASE name=target delta_gib=%.3f "
+                    "free_before_gib=%.3f free_after_gib=%.3f "
+                    "peak_allocated_gib=%.3f",
+                    (free_before_target - free_after_target) / (1 << 30),
+                    free_before_target / (1 << 30),
+                    free_after_target / (1 << 30),
+                    torch.cuda.max_memory_allocated() / (1 << 30),
+                )
         self.kv_connector.set_disabled(False)
 
         # Non-last PP ranks don't produce output for sampling.
@@ -833,6 +853,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
             with use_workspace_lane(self._draft_workspace_lane):
+                if trace_memory:
+                    torch.accelerator.synchronize()
+                    free_before_draft = torch.accelerator.get_memory_info()[0]
                 self.speculator.propose(
                     input_batch=input_batch,
                     attn_metadata=attn_metadata,
@@ -855,6 +878,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     mm_inputs=mm_inputs,
                     is_profile=is_profile,
                 )
+                if trace_memory:
+                    torch.accelerator.synchronize()
+                    free_after_draft = torch.accelerator.get_memory_info()[0]
+                    logger.info(
+                        "ACTIVATION_MEMORY_PHASE name=draft delta_gib=%.3f "
+                        "free_before_gib=%.3f free_after_gib=%.3f "
+                        "peak_allocated_gib=%.3f",
+                        (free_before_draft - free_after_draft) / (1 << 30),
+                        free_before_draft / (1 << 30),
+                        free_after_draft / (1 << 30),
+                        torch.cuda.max_memory_allocated() / (1 << 30),
+                    )
             self.step_timing.drafter_end()
 
         assert hidden_states is not None  # Last PP rank always has hidden_states
