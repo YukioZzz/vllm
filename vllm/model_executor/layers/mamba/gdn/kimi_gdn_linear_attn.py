@@ -9,7 +9,6 @@ from einops import rearrange
 from torch import nn
 from torch.nn.parameter import Parameter
 
-from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
 from vllm.distributed import divide, get_tensor_model_parallel_rank
 from vllm.forward_context import get_forward_context
@@ -377,7 +376,6 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
         output[:] = self.o_proj(core_attn_out)[0]
 
-    @eager_break_during_capture
     def _forward(
         self,
         mixed_qkv: torch.Tensor,
