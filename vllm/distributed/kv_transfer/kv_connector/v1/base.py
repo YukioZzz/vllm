@@ -507,6 +507,18 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
+    def note_external_tokens_from_other_connector(
+        self, request: "Request", num_external_tokens: int
+    ) -> None:
+        """Notify a non-selected child that another connector supplies KV.
+
+        Most connectors do not need this information. Cache writers can
+        override the hook to include externally populated destination blocks
+        in a subsequent write-through operation without issuing a duplicate
+        load themselves.
+        """
+        return
+
     @abstractmethod
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput

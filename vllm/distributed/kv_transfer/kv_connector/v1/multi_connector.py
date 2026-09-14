@@ -420,6 +420,9 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
                 c.update_state_after_alloc(request, blocks, num_external_tokens)
             else:
                 # Other connectors still receive the request's real blocks
+                c.note_external_tokens_from_other_connector(
+                    request, num_external_tokens
+                )
                 c.update_state_after_alloc(request, blocks, 0)
 
     def on_new_request(self, request: "Request") -> None:

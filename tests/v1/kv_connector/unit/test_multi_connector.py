@@ -198,6 +198,22 @@ def mc() -> MultiConnector:
     return mc
 
 
+def test_non_selected_connector_observes_external_tokens(mc: MultiConnector):
+    request = MagicMock()
+    blocks = MagicMock()
+    mc._requests_to_connector[request.request_id] = 0
+
+    mc.update_state_after_alloc(request, blocks, 96)
+
+    first, second = mc._connectors
+    first.note_external_tokens_from_other_connector.assert_not_called()
+    first.update_state_after_alloc.assert_called_once_with(request, blocks, 96)
+    second.note_external_tokens_from_other_connector.assert_called_once_with(
+        request, 96
+    )
+    second.update_state_after_alloc.assert_called_once_with(request, blocks, 0)
+
+
 # Helper function to compare directories recursively
 def _compare_directories(dir1: Path, dir2: Path) -> bool:
     """Compares two directories recursively for identical content."""
