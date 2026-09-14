@@ -25,6 +25,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import gc
+import os
 import threading
 import weakref
 from collections.abc import Callable
@@ -376,6 +377,11 @@ class BreakableCUDAGraphWrapper:
         # pre-capture prefetches are complete and don't leak into the graph.
         get_offloader().sync_prev_onload()
 
+        trace_memory = os.getenv("VLLM_MEMORY_PHASE_TRACE", "0") == "1"
+        if trace_memory:
+            torch.accelerator.synchronize()
+            free_before = torch.accelerator.get_memory_info()[0]
+
         capture = BreakableCUDAGraphCapture(pool=self.graph_pool)
         with capture:
             output = self.runnable(*args, **kwargs)
@@ -388,6 +394,21 @@ class BreakableCUDAGraphWrapper:
             # the cudagraph pool reclaim/reuse that memory immediately for
             # the next batch descriptor's capture.
             output = weak_ref_tensors(output)
+
+        if trace_memory:
+            torch.accelerator.synchronize()
+            free_after = torch.accelerator.get_memory_info()[0]
+            logger.info(
+                "BREAKABLE_CUDAGRAPH_MEMORY descriptor=%s segments=%d "
+                "eager_breaks=%d delta_mib=%.2f free_before_gib=%.3f "
+                "free_after_gib=%.3f",
+                entry.batch_descriptor,
+                capture.num_graphs,
+                capture.num_eager_breaks,
+                (free_before - free_after) / (1 << 20),
+                free_before / (1 << 30),
+                free_after / (1 << 30),
+            )
 
         entry.capture = capture
         entry.output = weak_ref_tensors(output)
