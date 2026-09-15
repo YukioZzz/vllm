@@ -578,6 +578,10 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
     # Served by passing the mask to the kernel; _build_decode turns away the
     # shapes AITER has no non-causal kernel for.
     supports_non_causal_multi_token_decode: ClassVar[bool] = True
+    # DSpark non-causal draft block is served at qseqlen>1 through the
+    # persistent mask0 decode + per-row LSE cross-rank merge, so it works
+    # under a DCP-sharded MLA cache (not just single-rank).
+    supports_non_causal_multi_token_dcp: ClassVar[bool] = True
     # Set from the common metadata every build; a batch is causal unless the
     # drafter says otherwise.
     _decode_causal: bool = True
@@ -1325,7 +1329,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             causal,
         )
         use_segmented_dcp_verify = (
-            self._supports_segmented_dcp_verify and max_qo_len > 1
+            self._supports_segmented_dcp_verify and max_qo_len > 1 and causal
         )
 
         # Segmented DCP verify carries its own per-row subpage table, so the
@@ -1462,7 +1466,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             # positions plus the qlen window *inside* the kernel, so is_causal
             # must be False whenever g_kv_indptr is handed over.
             cprr_kwargs: dict = {}
-            is_causal = True
+            is_causal = causal
             if self.dcp_world_size > 1:
                 cprr_kwargs = dict(
                     max_split_per_batch=self._mla_max_split_per_batch,
@@ -2339,7 +2343,8 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
             )
 
         if (
-            self.dcp_world_size > 1
+            attn_metadata.causal
+            and self.dcp_world_size > 1
             and int(decode.max_qo_len) > 1
             and decode.g_kv_indptr is None
         ):
