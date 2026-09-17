@@ -28,6 +28,11 @@ class SimpleCPUOffloadMetadata(KVConnectorMetadata):
     load_cpu_blocks: list[int] = field(default_factory=list)
     # Reverse map: load_event->req_ids, for tracking requests with finished load events
     load_event_to_reqs: dict[int, list[str]] = field(default_factory=dict)
+    # Debug-only P oracle: zero the allocated GPU destinations instead of
+    # copying from CPU. This preserves allocation and async completion shape.
+    oracle_zero_load: bool = False
+    oracle_mode: str = "off"
+    oracle_generation: int = 0
 
     # Store event per step. INVALID_JOB_ID means no blocks to store this step.
     store_event: int = INVALID_JOB_ID

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 import torch
@@ -485,6 +486,37 @@ def test_prompt_logprobs_skip_cpu_cache_lookup() -> None:
     ) == (0, False)
     assert retry_request_id not in sched._pending_cpu_hits
     assert all(block.ref_cnt == 0 for block in pinned_blocks)
+
+
+def test_prefill_oracle_runtime_hit_uses_zero_load(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "prefill_oracle.json"
+    config_path.write_text(
+        '{"generation":7,"mode":"nv_hit","logical_hit_ratio":0.5,"compute_speedup":1.0}'
+    )
+    monkeypatch.setenv("ROLE", "prefill")
+    monkeypatch.setenv("VLLM_PREFILL_ORACLE_CONFIG_PATH", str(config_path))
+    fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=16, lazy=False)
+    sched = fix.scheduler
+    req = make_request(num_blocks=4)
+
+    hit_tokens, is_async = sched.get_num_new_matched_tokens(req, num_computed_tokens=0)
+    assert (hit_tokens, is_async) == (2 * BLOCK_SIZE, True)
+
+    kv_blocks = _alloc_and_register(fix, req, num_blocks=4)
+    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=hit_tokens)
+    meta = sched.build_connector_meta(
+        make_scheduler_output(
+            {req.request_id: 0},
+            new_reqs={req.request_id: kv_blocks.get_block_ids()},
+        )
+    )
+    assert meta.oracle_zero_load
+    assert meta.oracle_mode == "nv_hit"
+    assert meta.oracle_generation == 7
+    assert meta.load_gpu_blocks
+    assert meta.load_cpu_blocks == []
 
 
 def test_eager_store_preserves_secondary_block_hashes() -> None:

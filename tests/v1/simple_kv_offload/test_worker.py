@@ -291,6 +291,29 @@ def test_transfer_hooks_pass_wait_event_for_store_only():
     assert load_calls[0]["wait_event"] is None
 
 
+def test_oracle_load_uses_zero_fill_instead_of_dma(monkeypatch):
+    worker = SimpleCPUOffloadWorker(
+        vllm_config=None, kv_cache_config=None, cpu_capacity_bytes=0
+    )
+    recording = _RecordingBackend()
+    worker._backend = recording
+    metadata = SimpleCPUOffloadMetadata(
+        load_event=4,
+        load_gpu_blocks=[1, 2],
+        oracle_zero_load=True,
+        oracle_mode="full_hit",
+        oracle_generation=9,
+    )
+    worker._connector_metadata = metadata
+    zero_loads = []
+    monkeypatch.setattr(worker, "_launch_oracle_zero_load", zero_loads.append)
+
+    worker.start_load_kv()
+
+    assert zero_loads == [metadata]
+    assert recording.calls == []
+
+
 def test_build_params_src_access_order():
     """build_params defaults to ANY and honors an explicit STREAM override."""
     gpu = {"k": torch.zeros((4, 64), dtype=torch.int8, device="cuda")}

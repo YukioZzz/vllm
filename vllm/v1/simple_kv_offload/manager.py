@@ -3,9 +3,13 @@
 """Scheduler-side manager for SimpleCPUOffloadConnector."""
 
 import contextlib
+import json
+import math
+import os
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from vllm.config import VllmConfig
@@ -79,6 +83,28 @@ class TransferMeta:
     gpu_block_ids: list[int]
     cpu_block_ids: list[int]
     block_meta: list[dict[BlockHashWithGroupId, BlockStoreMeta]] | None = None
+    oracle_zero: bool = False
+    oracle_mode: str = "off"
+    oracle_generation: int = 0
+
+
+@dataclass(frozen=True)
+class PrefillOracleConfig:
+    mode: str = "off"
+    generation: int = 0
+    logical_hit_ratio: float = 0.9523
+    compute_speedup: float = 1.55
+
+    @property
+    def enabled(self) -> bool:
+        return self.mode != "off"
+
+
+@dataclass(frozen=True)
+class PendingOracleHit:
+    hit_length: int
+    num_computed_tokens: int
+    config: PrefillOracleConfig
 
 
 @dataclass
@@ -222,6 +248,15 @@ class SimpleCPUOffloadScheduler:
         self._pending_cpu_hits: dict[
             str, tuple[tuple[list[KVCacheBlock], ...], int, int]
         ] = {}
+        oracle_path = os.getenv("VLLM_PREFILL_ORACLE_CONFIG_PATH", "")
+        self._oracle_config_path = (
+            Path(oracle_path)
+            if oracle_path and os.getenv("ROLE") == "prefill"
+            else None
+        )
+        self._oracle_config_mtime_ns = -1
+        self._oracle_config = PrefillOracleConfig()
+        self._pending_oracle_hits: dict[str, PendingOracleHit] = {}
 
         # Store metadata
         self._lazy_mode = lazy_offload
@@ -317,6 +352,69 @@ class SimpleCPUOffloadScheduler:
         Called by Scheduler after kv_cache_manager is ready."""
         self._gpu_block_pool = gpu_block_pool
 
+    def _get_oracle_config(self) -> PrefillOracleConfig:
+        path = self._oracle_config_path
+        if path is None:
+            return self._oracle_config
+        try:
+            mtime_ns = path.stat().st_mtime_ns
+        except FileNotFoundError:
+            return PrefillOracleConfig()
+        if mtime_ns == self._oracle_config_mtime_ns:
+            return self._oracle_config
+        try:
+            raw = json.loads(path.read_text())
+            config = PrefillOracleConfig(
+                mode=str(raw.get("mode", "off")),
+                generation=int(raw.get("generation", 0)),
+                logical_hit_ratio=float(raw.get("logical_hit_ratio", 0.9523)),
+                compute_speedup=float(raw.get("compute_speedup", 1.55)),
+            )
+            if config.mode not in {
+                "off",
+                "instant_load",
+                "nv_hit",
+                "full_hit",
+                "nv_compute",
+            }:
+                raise ValueError(f"unsupported mode {config.mode!r}")
+            if not 0.0 <= config.logical_hit_ratio <= 1.0:
+                raise ValueError("logical_hit_ratio must be in [0, 1]")
+            if not math.isfinite(config.compute_speedup) or config.compute_speedup < 1:
+                raise ValueError("compute_speedup must be finite and >= 1")
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            logger.error("Ignoring invalid prefill Oracle config %s: %s", path, exc)
+            config = PrefillOracleConfig()
+        self._oracle_config_mtime_ns = mtime_ns
+        if config != self._oracle_config:
+            logger.warning(
+                "PREFILL_ORACLE_CONFIG mode=%s generation=%d "
+                "logical_hit_ratio=%.6f compute_speedup=%.3f",
+                config.mode,
+                config.generation,
+                config.logical_hit_ratio,
+                config.compute_speedup,
+            )
+        self._oracle_config = config
+        return config
+
+    def _oracle_hit_length(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+        max_hit_len: int,
+        config: PrefillOracleConfig,
+    ) -> int:
+        if config.mode == "full_hit":
+            target = request.num_tokens - 1
+        else:
+            physical_miss_ratio = 1.0 - config.logical_hit_ratio
+            if config.mode == "nv_compute":
+                physical_miss_ratio /= config.compute_speedup
+            target = int((request.num_tokens - 1) * (1.0 - physical_miss_ratio))
+        target = target // self.hash_block_size * self.hash_block_size
+        return min(max_hit_len, max(0, target - num_computed_tokens))
+
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
     ) -> tuple[int | None, bool]:
@@ -328,6 +426,7 @@ class SimpleCPUOffloadScheduler:
         # is dropped first.
         if stale := self._pending_cpu_hits.pop(request.request_id, None):
             self._free_pending_cpu_hit(stale)
+        self._pending_oracle_hits.pop(request.request_id, None)
 
         if request.skip_reading_prefix_cache:
             return 0, False
@@ -356,11 +455,56 @@ class SimpleCPUOffloadScheduler:
         max_hit_len = request.num_tokens - 1 - num_computed_tokens
         if max_hit_len <= 0:
             return 0, False
+        oracle_config = self._get_oracle_config()
+        if oracle_config.mode in {"nv_hit", "full_hit", "nv_compute"}:
+            hit_length = self._oracle_hit_length(
+                request, num_computed_tokens, max_hit_len, oracle_config
+            )
+            if hit_length > 0:
+                self._pending_oracle_hits[request.request_id] = PendingOracleHit(
+                    hit_length, num_computed_tokens, oracle_config
+                )
+                logical_miss = int(
+                    (request.num_tokens - 1) * (1 - oracle_config.logical_hit_ratio)
+                )
+                logger.info(
+                    "PREFILL_ORACLE_MATCH req=%s mode=%s generation=%d "
+                    "prompt=%d local=%d zero_tokens=%d physical_compute=%d "
+                    "logical_compute=%d",
+                    request.request_id,
+                    oracle_config.mode,
+                    oracle_config.generation,
+                    request.num_tokens,
+                    num_computed_tokens,
+                    hit_length,
+                    max_hit_len - hit_length,
+                    logical_miss,
+                )
+                return hit_length, True
+            return 0, False
         cpu_hit_blocks, hit_length, _ = self.cpu_coordinator.find_longest_cache_hit(
             remaining_hashes, max_hit_len
         )
 
         if hit_length > 0:
+            if oracle_config.mode == "instant_load":
+                self._pending_oracle_hits[request.request_id] = PendingOracleHit(
+                    hit_length, num_computed_tokens, oracle_config
+                )
+                logger.info(
+                    "PREFILL_ORACLE_MATCH req=%s mode=%s generation=%d "
+                    "prompt=%d local=%d zero_tokens=%d physical_compute=%d "
+                    "logical_compute=%d",
+                    request.request_id,
+                    oracle_config.mode,
+                    oracle_config.generation,
+                    request.num_tokens,
+                    num_computed_tokens,
+                    hit_length,
+                    max_hit_len - hit_length,
+                    max_hit_len - hit_length,
+                )
+                return hit_length, True
             pin_blocks = [
                 blk for grp in cpu_hit_blocks for blk in grp if not blk.is_null
             ]
@@ -399,6 +543,7 @@ class SimpleCPUOffloadScheduler:
         # found blocks were pinned there to survive LRU eviction in the window
         # between get_num_new_matched_tokens() and this matching call.
         pending = self._pending_cpu_hits.pop(req_id, None)
+        oracle_pending = self._pending_oracle_hits.pop(req_id, None)
 
         if num_external_tokens == 0:
             if pending is not None:
@@ -410,6 +555,42 @@ class SimpleCPUOffloadScheduler:
                     req_id,
                 )
                 self._free_pending_cpu_hit(pending)
+            return
+
+        if oracle_pending is not None:
+            assert pending is None
+            assert num_external_tokens <= oracle_pending.hit_length
+            num_computed_tokens = oracle_pending.num_computed_tokens
+            assert num_computed_tokens % self.block_size == 0
+            assert num_external_tokens % self.hash_block_size == 0
+            assert self._gpu_block_pool is not None
+
+            gpu_block_ids: list[int] = []
+            for group_idx, group_gpu_ids in enumerate(block_ids_by_group):
+                group_block_size = self.group_block_sizes[group_idx]
+                gpu_ext_start = num_computed_tokens // group_block_size
+                num_external_blocks = cdiv(num_external_tokens, group_block_size)
+                for gpu_block_id in group_gpu_ids[
+                    gpu_ext_start : gpu_ext_start + num_external_blocks
+                ]:
+                    if not self._gpu_block_pool.blocks[gpu_block_id].is_null:
+                        gpu_block_ids.append(gpu_block_id)
+
+            self._gpu_block_pool.touch(
+                [self._gpu_block_pool.blocks[bid] for bid in gpu_block_ids]
+            )
+            assert self._reqs_to_load.get(req_id) is None
+            config = oracle_pending.config
+            self._reqs_to_load[req_id] = LoadRequestState(
+                request=request,
+                transfer_meta=TransferMeta(
+                    gpu_block_ids,
+                    [],
+                    oracle_zero=True,
+                    oracle_mode=config.mode,
+                    oracle_generation=config.generation,
+                ),
+            )
             return
 
         if pending is None:
@@ -520,6 +701,8 @@ class SimpleCPUOffloadScheduler:
         load_gpu: list[int] = []
         load_cpu: list[int] = []
         load_req_ids: list[str] = []
+        oracle_load_configs: set[tuple[str, int]] = set()
+        has_regular_load = False
         for req_id, load_state in self._reqs_to_load.items():
             if load_state.load_event is not None:
                 continue
@@ -527,6 +710,23 @@ class SimpleCPUOffloadScheduler:
             load_gpu.extend(load_state.transfer_meta.gpu_block_ids)
             load_cpu.extend(load_state.transfer_meta.cpu_block_ids)
             load_req_ids.append(req_id)
+            if load_state.transfer_meta.oracle_zero:
+                oracle_load_configs.add(
+                    (
+                        load_state.transfer_meta.oracle_mode,
+                        load_state.transfer_meta.oracle_generation,
+                    )
+                )
+            else:
+                has_regular_load = True
+        if oracle_load_configs and (has_regular_load or len(oracle_load_configs) != 1):
+            raise RuntimeError(
+                "Prefill Oracle mode changed while KV loads were pending; "
+                "switch modes only after the engine is idle"
+            )
+        oracle_mode, oracle_generation = (
+            next(iter(oracle_load_configs)) if oracle_load_configs else ("off", 0)
+        )
         if load_req_ids:
             load_event = self._load_event_counter
             self._load_event_counter += 1
@@ -542,6 +742,9 @@ class SimpleCPUOffloadScheduler:
                 event_idx: list(req_ids)
                 for event_idx, req_ids in self._load_event_to_reqs.items()
             },
+            oracle_zero_load=bool(oracle_load_configs),
+            oracle_mode=oracle_mode,
+            oracle_generation=oracle_generation,
             store_event=store_event,
             store_gpu_blocks=store_gpu,
             store_cpu_blocks=store_cpu,
@@ -1120,6 +1323,7 @@ class SimpleCPUOffloadScheduler:
         pending = self._pending_cpu_hits.pop(req_id, None)
         if pending is not None:
             self._free_pending_cpu_hit(pending)
+        self._pending_oracle_hits.pop(req_id, None)
 
         # Handle load: defer cleanup if load is in-flight
         load_state = self._reqs_to_load.get(req_id)
@@ -1332,6 +1536,7 @@ class SimpleCPUOffloadScheduler:
                 self._abandoned_reqs_to_load[req_id] = state
 
         self._reqs_to_store.clear()
+        self._pending_oracle_hits.clear()
         self._store_event_to_reqs.clear()
         self._store_event_pending_counts = {
             event_idx: count

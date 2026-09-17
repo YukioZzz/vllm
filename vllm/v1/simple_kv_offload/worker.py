@@ -262,7 +262,10 @@ class SimpleCPUOffloadWorker:
         # op overhead (~5ms) stays hidden behind GPU compute. Stores are
         # issued in wait_for_save().
         metadata = self._connector_metadata
-        if metadata is not None and metadata.load_cpu_blocks:
+        if metadata is not None and metadata.load_gpu_blocks:
+            if metadata.oracle_zero_load:
+                self._launch_oracle_zero_load(metadata)
+                return
             backend = self._backend
             assert backend is not None
             backend.launch_copy(
@@ -272,6 +275,27 @@ class SimpleCPUOffloadWorker:
                 event_idx=metadata.load_event,
                 events_list=self._load_events,
             )
+
+    def _launch_oracle_zero_load(self, metadata: SimpleCPUOffloadMetadata) -> None:
+        """Zero fake-hit destinations while preserving async load semantics."""
+        assert self.gpu_kv_caches is not None
+        assert self.load_stream is not None
+        assert self.device is not None
+        block_ids = sorted(set(metadata.load_gpu_blocks))
+        with torch.cuda.stream(self.load_stream):
+            indices = torch.tensor(block_ids, dtype=torch.long, device=self.device)
+            for cache in self.gpu_kv_caches.values():
+                cache.index_fill_(0, indices, 0)
+            event = torch.Event()
+            event.record(self.load_stream)
+        self._load_events.append((metadata.load_event, event))
+        logger.info(
+            "PREFILL_ORACLE_ZERO mode=%s generation=%d event=%d blocks=%d",
+            metadata.oracle_mode,
+            metadata.oracle_generation,
+            metadata.load_event,
+            len(block_ids),
+        )
 
     def wait_for_save(self) -> None:
         """Submit async stores.
