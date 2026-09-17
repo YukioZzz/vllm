@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Worker-side handler for SimpleCPUOffloadConnector."""
 
+import os
+import time
 from typing import TYPE_CHECKING
 
 import torch
@@ -78,6 +80,11 @@ class SimpleCPUOffloadWorker:
         self._pending_store_event_indices: set[int] = set()
         # Completed store events to report via build_connector_worker_meta
         self._completed_store_events: dict[int, int] = {}
+        self._trace_enabled = os.getenv("VLLM_PD_STAGE_TRACE", "0") == "1"
+        self._trace_rank = vllm_config.parallel_config.rank == 0
+        self._bytes_per_block = 0
+        self._load_trace: dict[int, tuple[float, int, tuple[str, ...]]] = {}
+        self._store_trace: dict[int, tuple[float, int, tuple[str, ...]]] = {}
 
     def register_kv_caches(
         self,
@@ -158,6 +165,7 @@ class SimpleCPUOffloadWorker:
             t.stride(0) * t.element_size() for t in unique_gpu_caches.values()
         ]
         total_bytes_per_block = sum(per_tensor_bpb)
+        self._bytes_per_block = total_bytes_per_block
 
         self.num_cpu_blocks = max(1, self.cpu_capacity_bytes // total_bytes_per_block)
 
@@ -268,6 +276,21 @@ class SimpleCPUOffloadWorker:
                 return
             backend = self._backend
             assert backend is not None
+            event_idx = metadata.load_event
+            if self._trace_enabled and self._trace_rank:
+                req_ids = tuple(metadata.load_event_to_reqs.get(event_idx, ()))
+                num_bytes = len(metadata.load_cpu_blocks) * self._bytes_per_block
+                self._load_trace[event_idx] = (time.monotonic(), num_bytes, req_ids)
+                logger.info(
+                    "PD_STAGE_SIMPLECPU_DMA_START role=%s kind=load event=%d "
+                    "requests=%d blocks=%d bytes=%d reqs=%s",
+                    os.getenv("ROLE", "unknown"),
+                    event_idx,
+                    len(req_ids),
+                    len(metadata.load_cpu_blocks),
+                    num_bytes,
+                    ",".join(req_ids),
+                )
             backend.launch_copy(
                 metadata.load_cpu_blocks,
                 metadata.load_gpu_blocks,
@@ -316,6 +339,18 @@ class SimpleCPUOffloadWorker:
             if self._store_compute_done is None:
                 self._store_compute_done = torch.Event()
             self._store_compute_done.record(torch.cuda.current_stream())
+            event_idx = metadata.store_event
+            if self._trace_enabled and self._trace_rank:
+                num_bytes = len(metadata.store_gpu_blocks) * self._bytes_per_block
+                self._store_trace[event_idx] = (time.monotonic(), num_bytes, ())
+                logger.info(
+                    "PD_STAGE_SIMPLECPU_DMA_START role=%s kind=store event=%d "
+                    "blocks=%d bytes=%d",
+                    os.getenv("ROLE", "unknown"),
+                    event_idx,
+                    len(metadata.store_gpu_blocks),
+                    num_bytes,
+                )
             backend.launch_copy(
                 metadata.store_gpu_blocks,
                 metadata.store_cpu_blocks,
@@ -399,6 +434,23 @@ class SimpleCPUOffloadWorker:
                 break
             hwm = event_idx
             events.pop(0)
+            if self._trace_enabled and self._trace_rank:
+                trace = (self._store_trace if is_store else self._load_trace).pop(
+                    event_idx, None
+                )
+                if trace is not None:
+                    started, num_bytes, req_ids = trace
+                    logger.info(
+                        "PD_STAGE_SIMPLECPU_DMA_DONE role=%s kind=%s event=%d "
+                        "elapsed_ms=%.3f bytes=%d requests=%d reqs=%s",
+                        os.getenv("ROLE", "unknown"),
+                        "store" if is_store else "load",
+                        event_idx,
+                        (time.monotonic() - started) * 1000,
+                        num_bytes,
+                        len(req_ids),
+                        ",".join(req_ids),
+                    )
         if is_store:
             self._store_hwm = hwm
         else:

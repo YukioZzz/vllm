@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
 import math
+import os
 import queue
 import threading
 import time
@@ -1599,6 +1600,9 @@ class MoRIIOConnectorWorker:
         # wrapped by the attention KV-transfer decorator, so wait_for_layer_load
         # never fires for them and these must be awaited in start_load_kv.
         self._mamba_reads_this_step: list = []
+        self._trace_enabled = os.getenv("VLLM_PD_STAGE_TRACE", "0") == "1"
+        self._trace_rank = self._rank == 0
+        self._trace_read_reqs_this_step: list[str] = []
 
         # Track the expiration time of requests that are waiting to be sent.
         self._reqs_to_send: dict[ReqId, float] = {}
@@ -2574,6 +2578,18 @@ class MoRIIOConnectorWorker:
                 ]
                 state = self.moriio_wrapper.poll_transfer_batch(statuses)
                 if statuses and state is TransferBatchState.DONE:
+                    if self._trace_enabled and self._trace_rank:
+                        started = self._recving_transfers_start.get(req_id)
+                        logger.info(
+                            "PD_STAGE_MORIIO_DONE role=%s req=%s statuses=%d "
+                            "lifetime_ms=%.3f",
+                            os.getenv("ROLE", "unknown"),
+                            req_id,
+                            len(statuses),
+                            (time.monotonic() - started) * 1000
+                            if started is not None
+                            else -1.0,
+                        )
                     host, port, xfer_id = self._recving_transfers_callback_addr[req_id]
                     done_req_ids.add(xfer_id)
                     self.moriio_wrapper.send_notify(
@@ -2665,14 +2681,27 @@ class MoRIIOConnectorWorker:
         self._reads_issued_this_step = []
         mamba_statuses = self._mamba_reads_this_step
         self._mamba_reads_this_step = []
+        trace_req_ids = self._trace_read_reqs_this_step
+        self._trace_read_reqs_this_step = []
         if get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL:
             statuses = all_statuses
         else:
             statuses = mamba_statuses
         if not statuses:
             return
+        wait_start = time.monotonic() if self._trace_enabled else 0.0
         try:
             self.moriio_wrapper.waiting_for_transfer_complete(statuses)
+            if self._trace_enabled and self._trace_rank:
+                logger.info(
+                    "PD_STAGE_MORIIO_BARRIER role=%s requests=%d statuses=%d "
+                    "wait_ms=%.3f reqs=%s",
+                    os.getenv("ROLE", "unknown"),
+                    len(trace_req_ids),
+                    len(statuses),
+                    (time.monotonic() - wait_start) * 1000,
+                    ",".join(trace_req_ids),
+                )
         except TransferError:
             if self._has_mamba:
                 logger.exception(
@@ -2914,6 +2943,7 @@ class MoRIIOConnectorWorker:
         Start loading by triggering non-blocking moriio_xfer.
         We check for these trnxs to complete in each step().
         """
+        stage_start = time.monotonic() if self._trace_enabled else 0.0
         self.transfer_id_to_request_id = metadata.transfer_id_to_request_id
         if self.is_producer:
             live_transfer_ids = set(self.transfer_id_to_request_id)
@@ -2997,6 +3027,15 @@ class MoRIIOConnectorWorker:
 
         self._await_reads_issued_this_step()
         self._reqs_to_send.update(metadata.reqs_to_send)
+        if self._trace_enabled and self._trace_rank:
+            logger.info(
+                "PD_STAGE_MORIIO_START_LOAD role=%s requests=%d elapsed_ms=%.3f "
+                "reqs=%s",
+                os.getenv("ROLE", "unknown"),
+                len(metadata.reqs_to_recv),
+                (time.monotonic() - stage_start) * 1000,
+                ",".join(metadata.reqs_to_recv),
+            )
 
     def wait_for_save(self, metadata: MoRIIOConnectorMetadata):
         if self.mode == MoRIIOMode.WRITE and self.is_producer:
@@ -3051,6 +3090,8 @@ class MoRIIOConnectorWorker:
             req_id,
         )
         chosen_tp, flexible = self._resolve_read_source(meta)
+        if self._trace_enabled and self._trace_rank:
+            self._trace_read_reqs_this_step.append(req_id)
         self._read_blocks(
             request_id=req_id,
             transfer_id=meta.transfer_id,

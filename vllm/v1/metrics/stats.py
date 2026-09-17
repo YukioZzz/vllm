@@ -1,18 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-import vllm.envs as envs
+from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
+from vllm.logger import init_logger
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 if TYPE_CHECKING:
     from vllm.v1.engine import EngineCoreEvent, EngineCoreOutput, FinishReason
+
+
+logger = init_logger(__name__)
+_PD_STAGE_TRACE = os.getenv("VLLM_PD_STAGE_TRACE", "0") == "1"
 
 
 @dataclass
@@ -578,6 +584,22 @@ class IterationStats:
             num_cached_tokens=num_cached_tokens,
         )
         self.finished_requests.append(finished_req)
+
+        if _PD_STAGE_TRACE:
+            logger.info(
+                "PD_STAGE_REQUEST role=%s req=%s prompt=%d cached=%d "
+                "arrival_to_queue_ms=%.3f queue_ms=%.3f prefill_ms=%.3f "
+                "decode_ms=%.3f e2e_ms=%.3f",
+                os.getenv("ROLE", "unknown"),
+                request_id,
+                num_prompt_tokens,
+                num_cached_tokens,
+                (req_stats.queued_ts - req_stats.arrival_time) * 1000,
+                queued_time * 1000,
+                prefill_time * 1000,
+                decode_time * 1000,
+                e2e_latency * 1000,
+            )
 
         # Count corrupted requests when they finish (only once per request)
         if req_stats.is_corrupted:

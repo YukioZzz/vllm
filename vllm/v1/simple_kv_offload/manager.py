@@ -6,6 +6,7 @@ import contextlib
 import json
 import math
 import os
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
@@ -60,6 +61,7 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+_PD_STAGE_TRACE = os.getenv("VLLM_PD_STAGE_TRACE", "0") == "1"
 
 
 @dataclass
@@ -420,6 +422,8 @@ class SimpleCPUOffloadScheduler:
     ) -> tuple[int | None, bool]:
         """Return (num_new_tokens, is_async) from consecutive CPU cache hits."""
 
+        lookup_start = time.monotonic() if _PD_STAGE_TRACE else 0.0
+
         # Pins found CPU blocks so they survive LRU eviction until
         # update_state_after_alloc() consumes them. Any pin from an earlier
         # call on the same request (e.g. retry after a failed allocate_slots)
@@ -485,6 +489,20 @@ class SimpleCPUOffloadScheduler:
         cpu_hit_blocks, hit_length, _ = self.cpu_coordinator.find_longest_cache_hit(
             remaining_hashes, max_hit_len
         )
+
+        if _PD_STAGE_TRACE:
+            logger.info(
+                "PD_STAGE_SIMPLECPU_LOOKUP role=%s req=%s prompt=%d local=%d "
+                "max_external=%d external=%d hashes=%d lookup_ms=%.3f",
+                os.getenv("ROLE", "unknown"),
+                request.request_id,
+                request.num_tokens,
+                num_computed_tokens,
+                max_hit_len,
+                hit_length,
+                len(remaining_hashes),
+                (time.monotonic() - lookup_start) * 1000,
+            )
 
         if hit_length > 0:
             if oracle_config.mode == "instant_load":
@@ -665,6 +683,16 @@ class SimpleCPUOffloadScheduler:
         self._reqs_to_load[req_id] = LoadRequestState(
             request=request, transfer_meta=TransferMeta(gpu_block_ids, cpu_block_ids)
         )
+        if _PD_STAGE_TRACE:
+            logger.info(
+                "PD_STAGE_SIMPLECPU_ALLOC role=%s req=%s external=%d "
+                "gpu_blocks=%d cpu_blocks=%d",
+                os.getenv("ROLE", "unknown"),
+                req_id,
+                num_external_tokens,
+                len(gpu_block_ids),
+                len(cpu_block_ids),
+            )
 
     def build_connector_meta(
         self,
