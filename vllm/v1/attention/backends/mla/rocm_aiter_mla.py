@@ -433,6 +433,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
     # Served by passing the mask to the kernel; _build_decode turns away the
     # shapes AITER has no non-causal kernel for.
     supports_non_causal_multi_token_decode: ClassVar[bool] = True
+    supports_non_causal_multi_token_dcp: ClassVar[bool] = True
     # Set from the common metadata every build; a batch is causal unless the
     # drafter says otherwise.
     _decode_causal: bool = True
@@ -489,6 +490,10 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             parallel_config.decode_context_parallel_size,
             parallel_config.cp_kv_cache_interleave_size,
         )
+        # The class-level capability lets the selector consider AITER. The
+        # builder enforces the narrower runtime constraint (currently only
+        # token-granular DCP interleaving) before constructing any metadata.
+        self.supports_non_causal_multi_token_dcp = supports_segmented_dcp_verify
         super().__init__(
             kv_cache_spec,
             layer_names,

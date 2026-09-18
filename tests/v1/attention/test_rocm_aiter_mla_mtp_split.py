@@ -154,6 +154,49 @@ def test_backend_declares_uniform_batch_support():
         AiterMLAMetadataBuilder._cudagraph_support
         == rocm_aiter_mla.AttentionCGSupport.UNIFORM_BATCH
     )
+    assert AiterMLAMetadataBuilder.supports_non_causal_multi_token_dcp
+
+
+def test_non_causal_dcp_capability_requires_token_interleave(monkeypatch):
+    monkeypatch.setattr(rocm_aiter_mla, "_segmented_mla_decode_supported", lambda: True)
+
+    assert rocm_aiter_mla._segmented_dcp_verify_supported(8, 1)
+    assert not rocm_aiter_mla._segmented_dcp_verify_supported(8, 1536)
+
+
+@pytest.mark.parametrize(
+    ("dcp_world_size", "interleave", "expected"),
+    [(1, 1, False), (8, 1, True), (8, 1536, False)],
+)
+def test_builder_gates_non_causal_dcp_by_layout(
+    monkeypatch, dcp_world_size, interleave, expected
+):
+    observed = []
+
+    class InitCaptured(Exception):
+        pass
+
+    def capture_capability(self, *_args, **_kwargs):
+        observed.append(self.supports_non_causal_multi_token_dcp)
+        raise InitCaptured
+
+    monkeypatch.setattr(
+        rocm_aiter_mla.MLACommonMetadataBuilder,
+        "__init__",
+        capture_capability,
+    )
+    monkeypatch.setattr(rocm_aiter_mla, "_segmented_mla_decode_supported", lambda: True)
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=dcp_world_size,
+            cp_kv_cache_interleave_size=interleave,
+        )
+    )
+
+    with pytest.raises(InitCaptured):
+        AiterMLAMetadataBuilder(object(), [], config, torch.device("cpu"))
+
+    assert observed == [expected]
 
 
 @pytest.mark.parametrize("causal", [True, False])
