@@ -295,6 +295,35 @@ def test_dcp_fp8_verify_build_uses_segmented(monkeypatch):
     assert metadata.dcp_verify is not None
 
 
+def test_asm_dcp_verify_falls_back_to_segmented_for_qlen_two(monkeypatch):
+    """A dynamic qlen-2 batch is below CPRR's kernel floor, not fatal."""
+    monkeypatch.setattr(rocm_aiter_mla, "_segmented_mla_decode_supported", lambda: True)
+
+    builder = _builder(
+        mtp_decode_qlen=5,
+        dcp_world_size=2,
+        kv_cache_dtype="fp8",
+        kernel_block_size=2,
+    )
+    builder._asm_dcp_verify = True
+    builder._asm_dcp_verify_heads = 32
+
+    metadata = AiterMLAMetadataBuilder._build_decode(
+        builder,
+        block_table_tensor=torch.tensor([[0, 1, 2]], dtype=torch.int32),
+        seq_lens_device=torch.tensor([3], dtype=torch.int32),
+        max_seq_len=3,
+        query_start_loc_cpu=torch.tensor([0, 2], dtype=torch.int32),
+        query_start_loc_device=torch.tensor([0, 2], dtype=torch.int32),
+        num_decode_tokens=2,
+        dcp_tot_seq_lens_device=torch.tensor([6], dtype=torch.int32),
+    )
+
+    assert metadata.dcp_verify is not None
+    assert metadata.g_kv_indptr is None
+    assert not metadata.has_persistent_metadata
+
+
 def test_single_token_dcp_decode_returns_unpadded_lse(monkeypatch):
     """Single-token DCP decode must come back with an LSE the merge can use.
 

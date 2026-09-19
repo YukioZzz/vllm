@@ -25,6 +25,7 @@ _parse = rocm_aiter_mla._parse_dcp_verify_env
 _heads = rocm_aiter_mla._asm_dcp_verify_heads
 _selected = rocm_aiter_mla._asm_dcp_verify_selected
 _configured = rocm_aiter_mla._asm_dcp_verify_configured
+_use_segmented = rocm_aiter_mla._use_segmented_dcp_verify
 NATIVE = rocm_aiter_mla._NATIVE_CPRR_HEADS
 MIN_QLEN = rocm_aiter_mla._MIN_CPRR_QLEN
 
@@ -224,6 +225,23 @@ def test_min_cprr_qlen_is_above_two():
     qlen 2, where a row can still be causally truncated. The builder must
     refuse it at boot rather than degrade acceptance silently."""
     assert MIN_QLEN > 2
+
+
+@pytest.mark.parametrize(
+    "supports_segmented,asm_selected,qlen,causal,expected",
+    [
+        (True, True, 2, True, True),
+        (True, True, MIN_QLEN, True, False),
+        (True, False, MIN_QLEN, True, True),
+        (False, True, 2, True, False),
+        (True, True, 2, False, False),
+        (True, True, 1, True, False),
+    ],
+)
+def test_segmented_fallback_covers_cprr_qlen_gap(
+    supports_segmented, asm_selected, qlen, causal, expected
+):
+    assert _use_segmented(supports_segmented, asm_selected, qlen, causal) is expected
 
 
 # Kernel numerics live in test_rocm_aiter_mla_dcp_cprr_numerics.py, which runs

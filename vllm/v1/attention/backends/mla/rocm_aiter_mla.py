@@ -344,6 +344,26 @@ def _asm_dcp_verify_configured(
     return bool(on_gfx950())
 
 
+def _use_segmented_dcp_verify(
+    supports_segmented: bool,
+    asm_selected: bool,
+    max_qo_len: int,
+    causal: bool,
+) -> bool:
+    """Select segmented DCP verify when asm cannot serve this batch.
+
+    The CPRR kernels start at qlen 3. A configured speculative width can still
+    shrink to qlen 2 for an individual batch, so an asm-selected group needs
+    the segmented path as a correctness fallback for that batch.
+    """
+    return (
+        supports_segmented
+        and causal
+        and max_qo_len > 1
+        and (not asm_selected or max_qo_len < _MIN_CPRR_QLEN)
+    )
+
+
 def _aiter_mla_small_head_mode() -> str:
     """Small-head (<16) MLA decode kernel selection.
 
@@ -641,9 +661,9 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             parallel_config.decode_context_parallel_size,
             parallel_config.cp_kv_cache_interleave_size,
         )
-        # prefer the tuned fp8 asm cprr decode for DCP verify.
-        # When it can serve this shape it *replaces* the segmented route, so the
-        # two are mutually exclusive and only one set of buffers is allocated.
+        # Prefer the tuned fp8 asm cprr decode for DCP verify. Keep segmented
+        # support available as a per-batch fallback because scheduling can
+        # shrink a configured qlen >= 3 to qlen 2, which CPRR cannot serve.
         # The head-count half of the predicate needs self.num_heads, which is
         # per-KV-group and only known after super().__init__; the config half is
         # enough to answer supports_dcp_with_varlen for the DSpark DCP gate.
@@ -680,8 +700,6 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
                     "Set VLLM_ROCM_AITER_MLA_DCP_VERIFY=segmented."
                 )
             self._asm_dcp_verify = True
-            # The asm route replaces the segmented one; never build both.
-            supports_segmented_dcp_verify = False
         self._supports_segmented_dcp_verify = supports_segmented_dcp_verify
         # Cap on per-batch KV splits, defaulting to one split per CU.
         #
@@ -719,11 +737,14 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         # for qlen 1 (a decode row sees every local token) but WRONG for qlen
         # 2, where a row can still be causally truncated.
         #
-        # This rejects a CONFIGURED qlen of 2, the steady state at nspec=1. It
-        # does not cover a qlen-2 batch arriving under a larger configured
-        # threshold, which the scheduler can produce by clamping a running spec
-        # request; _forward_decode raises for that.
-        if self._asm_dcp_verify and 1 < self._mtp_decode_qlen < _MIN_CPRR_QLEN:
+        # This rejects a CONFIGURED qlen of 2 only when the segmented fallback
+        # is unavailable. A larger configured width may still shrink to qlen 2
+        # at runtime; _build_decode routes that batch to segmented verification.
+        if (
+            self._asm_dcp_verify
+            and not self._supports_segmented_dcp_verify
+            and 1 < self._mtp_decode_qlen < _MIN_CPRR_QLEN
+        ):
             raise ValueError(
                 "ROCM_AITER_MLA asm cprr DCP verify has no kernel below qlen "
                 f"{_MIN_CPRR_QLEN}, but this KV group decodes at qlen "
@@ -1328,8 +1349,11 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             self.dcp_world_size,
             causal,
         )
-        use_segmented_dcp_verify = (
-            self._supports_segmented_dcp_verify and max_qo_len > 1 and causal
+        use_segmented_dcp_verify = _use_segmented_dcp_verify(
+            self._supports_segmented_dcp_verify,
+            self._asm_dcp_verify,
+            int(max_qo_len),
+            causal,
         )
 
         # Segmented DCP verify carries its own per-row subpage table, so the
@@ -1399,6 +1423,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         g_kv_indptr = None
         if (
             self._asm_dcp_verify
+            and not use_segmented_dcp_verify
             and self.dcp_world_size > 1
             and g_tot_seq_lens is not None
         ):
