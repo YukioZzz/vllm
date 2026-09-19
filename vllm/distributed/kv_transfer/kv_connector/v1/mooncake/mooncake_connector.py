@@ -1055,6 +1055,9 @@ class MooncakeConnectorWorker:
         # Block IDs are only unique within a group, so with multiple groups
         # load failures are reported per request instead.
         self._failed_recv_reqs: queue.Queue[ReqId] = queue.Queue()
+        self._failed_recv_block_ids: queue.Queue[tuple[ReqId, tuple[set[int], ...]]] = (
+            queue.Queue()
+        )
 
         self.xfer_stats = MooncakeKVConnectorStats()
 
@@ -1887,10 +1890,28 @@ class MooncakeConnectorWorker:
             except queue.Empty:
                 break
 
+        failed_recving_block_ids: dict[ReqId, tuple[set[int], ...]] = {}
+        while True:
+            try:
+                req_id, block_groups = self._failed_recv_block_ids.get_nowait()
+            except queue.Empty:
+                break
+            existing = failed_recving_block_ids.get(req_id)
+            if existing is None:
+                failed_recving_block_ids[req_id] = block_groups
+            else:
+                assert len(existing) == len(block_groups)
+                failed_recving_block_ids[req_id] = tuple(
+                    left | right
+                    for left, right in zip(existing, block_groups, strict=True)
+                )
+        failed_recving_reqs.update(failed_recving_block_ids)
+
         return KVConnectorTransferResults(
             finished_sending=set(finished_sending_reqs or ()),
             finished_recving=set(finished_recving_reqs or ()),
             failed_recving=failed_recving_reqs,
+            failed_recving_block_ids=failed_recving_block_ids,
         )
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
@@ -1988,6 +2009,12 @@ class MooncakeConnectorWorker:
                 continue
             if self._is_hma_required:
                 self._failed_recv_reqs.put(pull_meta.d_req_id)
+                self._failed_recv_block_ids.put(
+                    (
+                        pull_meta.d_req_id,
+                        tuple(set(group) for group in pull_meta.local_block_ids),
+                    )
+                )
             else:
                 self._invalid_block_ids.put(invalid)
             self.finished_recving_reqs.add(pull_meta.d_req_id)
