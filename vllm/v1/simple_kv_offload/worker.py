@@ -300,20 +300,22 @@ class SimpleCPUOffloadWorker:
             )
 
     def _launch_oracle_zero_load(self, metadata: SimpleCPUOffloadMetadata) -> None:
-        """Zero fake-hit destinations while preserving async load semantics."""
+        """Complete a fake load, optionally zeroing its destination blocks."""
         assert self.gpu_kv_caches is not None
         assert self.load_stream is not None
         assert self.device is not None
         block_ids = sorted(set(metadata.load_gpu_blocks))
         with torch.cuda.stream(self.load_stream):
-            indices = torch.tensor(block_ids, dtype=torch.long, device=self.device)
-            for cache in self.gpu_kv_caches.values():
-                cache.index_fill_(0, indices, 0)
+            if metadata.oracle_mode != "nv_compute_no_touch":
+                indices = torch.tensor(block_ids, dtype=torch.long, device=self.device)
+                for cache in self.gpu_kv_caches.values():
+                    cache.index_fill_(0, indices, 0)
             event = torch.Event()
             event.record(self.load_stream)
         self._load_events.append((metadata.load_event, event))
         logger.info(
-            "PREFILL_ORACLE_ZERO mode=%s generation=%d event=%d blocks=%d",
+            "PREFILL_ORACLE_%s mode=%s generation=%d event=%d blocks=%d",
+            "NO_TOUCH" if metadata.oracle_mode == "nv_compute_no_touch" else "ZERO",
             metadata.oracle_mode,
             metadata.oracle_generation,
             metadata.load_event,

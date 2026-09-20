@@ -378,6 +378,7 @@ class SimpleCPUOffloadScheduler:
                 "nv_hit",
                 "full_hit",
                 "nv_compute",
+                "nv_compute_no_touch",
             }:
                 raise ValueError(f"unsupported mode {config.mode!r}")
             if not 0.0 <= config.logical_hit_ratio <= 1.0:
@@ -411,7 +412,7 @@ class SimpleCPUOffloadScheduler:
             target = request.num_tokens - 1
         else:
             physical_miss_ratio = 1.0 - config.logical_hit_ratio
-            if config.mode == "nv_compute":
+            if config.mode in {"nv_compute", "nv_compute_no_touch"}:
                 physical_miss_ratio /= config.compute_speedup
             target = int((request.num_tokens - 1) * (1.0 - physical_miss_ratio))
         target = target // self.hash_block_size * self.hash_block_size
@@ -460,7 +461,12 @@ class SimpleCPUOffloadScheduler:
         if max_hit_len <= 0:
             return 0, False
         oracle_config = self._get_oracle_config()
-        if oracle_config.mode in {"nv_hit", "full_hit", "nv_compute"}:
+        if oracle_config.mode in {
+            "nv_hit",
+            "full_hit",
+            "nv_compute",
+            "nv_compute_no_touch",
+        }:
             hit_length = self._oracle_hit_length(
                 request, num_computed_tokens, max_hit_len, oracle_config
             )

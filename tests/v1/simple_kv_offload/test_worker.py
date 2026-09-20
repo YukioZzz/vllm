@@ -314,6 +314,32 @@ def test_oracle_load_uses_zero_fill_instead_of_dma(monkeypatch):
     assert recording.calls == []
 
 
+def test_oracle_no_touch_records_completion_without_writing(monkeypatch):
+    worker = SimpleCPUOffloadWorker(
+        vllm_config=None, kv_cache_config=None, cpu_capacity_bytes=0
+    )
+    cache = MagicMock()
+    worker.gpu_kv_caches = {"layer": cache}
+    worker.load_stream = MagicMock()
+    worker.device = torch.device("cuda")
+    event = MagicMock()
+    monkeypatch.setattr(torch.cuda, "stream", lambda _: nullcontext())
+    monkeypatch.setattr(torch, "Event", lambda: event)
+    metadata = SimpleCPUOffloadMetadata(
+        load_event=5,
+        load_gpu_blocks=[1, 2],
+        oracle_zero_load=True,
+        oracle_mode="nv_compute_no_touch",
+        oracle_generation=10,
+    )
+
+    worker._launch_oracle_zero_load(metadata)
+
+    cache.index_fill_.assert_not_called()
+    event.record.assert_called_once_with(worker.load_stream)
+    assert worker._load_events == [(5, event)]
+
+
 def test_build_params_src_access_order():
     """build_params defaults to ANY and honors an explicit STREAM override."""
     gpu = {"k": torch.zeros((4, 64), dtype=torch.int8, device="cuda")}

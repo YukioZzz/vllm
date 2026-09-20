@@ -519,6 +519,36 @@ def test_prefill_oracle_runtime_hit_uses_zero_load(
     assert meta.load_cpu_blocks == []
 
 
+def test_prefill_oracle_no_touch_preserves_nv_compute_ratio(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "prefill_oracle.json"
+    config_path.write_text(
+        '{"generation":8,"mode":"nv_compute_no_touch",'
+        '"logical_hit_ratio":0.5,"compute_speedup":2.0}'
+    )
+    monkeypatch.setenv("ROLE", "prefill")
+    monkeypatch.setenv("VLLM_PREFILL_ORACLE_CONFIG_PATH", str(config_path))
+    fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=16, lazy=False)
+    sched = fix.scheduler
+    req = make_request(num_blocks=4)
+
+    hit_tokens, is_async = sched.get_num_new_matched_tokens(req, num_computed_tokens=0)
+    assert (hit_tokens, is_async) == (3 * BLOCK_SIZE, True)
+
+    kv_blocks = _alloc_and_register(fix, req, num_blocks=4)
+    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=hit_tokens)
+    meta = sched.build_connector_meta(
+        make_scheduler_output(
+            {req.request_id: 0},
+            new_reqs={req.request_id: kv_blocks.get_block_ids()},
+        )
+    )
+    assert meta.oracle_zero_load
+    assert meta.oracle_mode == "nv_compute_no_touch"
+    assert meta.oracle_generation == 8
+
+
 def test_eager_store_preserves_secondary_block_hashes() -> None:
     """CPU copies retain fine-grained hashes owned by the GPU block."""
     fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=16, lazy=False)
