@@ -15,7 +15,25 @@ Tip of the five DCP commits (as of this doc): `9e616f00fe` … `41a987d9d3`.
 
 ## Image / hardware
 
-- **Image:** `vllm/vllm-openai-rocm:nightly` (validated on a Sep 2026 nightly that already ships AITER with CPRR four-arg `mla_decode_fwd`, gluon `return_lse` / `use_2d_view`, and segmented Triton MLA).
+- **Image:** `vllm/vllm-openai-rocm:nightly` — a floating tag, so pin the digest we
+  actually measured on:
+
+  ```bash
+  docker pull vllm/vllm-openai-rocm@sha256:5550994c1874ef331c6aed3ea27ae1efb7f4cfd17a2f18f5466c2837b9bf5467
+  ```
+
+  | field | value |
+  |---|---|
+  | digest | `sha256:5550994c1874ef331c6aed3ea27ae1efb7f4cfd17a2f18f5466c2837b9bf5467` |
+  | image id | `5550994c1874` (49 GB) |
+  | created | `2026-09-18T05:16:56Z` |
+  | in-image vLLM | `0.3.1.dev85+gdee37d891.rocm723` |
+
+  This build already ships AITER with the CPRR four-arg `mla_decode_fwd`
+  (`g_kv_indptr`, `cp_world_size`, `cp_rank`, `causal`), gluon with
+  `return_lse` / `use_2d_view` / `min_kv_seq_len`, and the segmented Triton MLA
+  (`aiter.ops.triton.attention.mla`). AITER itself reports no version string in
+  this image, so gate on signatures rather than a version number.
 - **GPU:** AMD **MI355X (gfx950)**, 8 GPUs. Gluon Stage B is gfx950-only; do not expect A/B on MI300X without a different Stage B.
 - **Model:** Kimi-K3 + DSpark draft (paths below are PIT2 NFS; substitute your own).
 
