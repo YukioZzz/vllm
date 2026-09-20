@@ -286,6 +286,23 @@ class SimpleCPUOffloadScheduler:
         self._store_event_counter: int = 0
         self.boundary_store_stats = BoundaryStoreStats()
 
+        if _PD_STAGE_TRACE:
+            group_layout = tuple(
+                (
+                    index,
+                    type(group.kv_cache_spec).__name__,
+                    group.kv_cache_spec.block_size,
+                    group.is_eagle_group,
+                    len(group.layer_names),
+                )
+                for index, group in enumerate(kv_cache_config.kv_cache_groups)
+            )
+            logger.info(
+                "PD_STAGE_SIMPLECPU_GROUPS role=%s groups=%s",
+                os.getenv("ROLE", "unknown"),
+                group_layout,
+            )
+
         # For TP/PP: track partial store completions across steps.
         # Events must be reported by all world_size workers before considered complete.
         self._expected_worker_count = vllm_config.parallel_config.world_size
@@ -492,14 +509,24 @@ class SimpleCPUOffloadScheduler:
                 )
                 return hit_length, True
             return 0, False
-        cpu_hit_blocks, hit_length, _ = self.cpu_coordinator.find_longest_cache_hit(
-            remaining_hashes, max_hit_len
+        cpu_hit_blocks, hit_length, unreconciled_tokens = (
+            self.cpu_coordinator.find_longest_cache_hit(remaining_hashes, max_hit_len)
         )
 
         if _PD_STAGE_TRACE:
+            per_group_hits: tuple[int, ...] = ()
+            if unreconciled_tokens > 0:
+                _, per_group_hits = (
+                    self.cpu_coordinator.find_longest_cache_hit_per_group(
+                        remaining_hashes, max_hit_len
+                    )
+                )
+            store_stats = self.boundary_store_stats
             logger.info(
                 "PD_STAGE_SIMPLECPU_LOOKUP role=%s req=%s prompt=%d local=%d "
-                "max_external=%d external=%d hashes=%d lookup_ms=%.3f",
+                "max_external=%d external=%d hashes=%d lookup_ms=%.3f "
+                "unreconciled=%d group_hits=%s cpu_free=%d cpu_total=%d "
+                "boundary=%d/%d/%d/%d/%d/%d/%d/%d",
                 os.getenv("ROLE", "unknown"),
                 request.request_id,
                 request.num_tokens,
@@ -508,6 +535,18 @@ class SimpleCPUOffloadScheduler:
                 hit_length,
                 len(remaining_hashes),
                 (time.monotonic() - lookup_start) * 1000,
+                unreconciled_tokens,
+                per_group_hits,
+                self.cpu_block_pool.get_num_free_blocks(),
+                self.num_cpu_blocks,
+                store_stats.published,
+                store_stats.stored,
+                store_stats.dropped_cpu_full,
+                store_stats.dropped_request_gone,
+                store_stats.skipped_already_cached,
+                store_stats.skipped_in_flight,
+                store_stats.dropped_null_block,
+                store_stats.dropped_not_hashed,
             )
 
         if hit_length > 0:
