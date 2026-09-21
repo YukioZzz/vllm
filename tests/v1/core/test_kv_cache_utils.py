@@ -2376,6 +2376,46 @@ def test_get_kv_cache_config_one_worker():
     )
 
 
+def test_hybrid_group_size_override_reduces_k3_dspark_padding(monkeypatch):
+    specs = {
+        **{f"attn.{i}": new_kv_cache_spec() for i in range(29)},
+        **{f"mamba.{i}": new_mamba_spec() for i in range(69)},
+    }
+
+    default_groups = kv_cache_utils._get_kv_cache_groups_uniform_page_size(specs)
+    assert sorted(len(group.layer_names) for group in default_groups) == [
+        23,
+        23,
+        23,
+        29,
+    ]
+
+    monkeypatch.setenv("VLLM_KV_CACHE_GROUP_SIZE_OVERRIDE", "15")
+    groups = kv_cache_utils._get_kv_cache_groups_uniform_page_size(specs)
+
+    assert len(groups) == 7
+    assert sorted(len(group.layer_names) for group in groups) == [
+        13,
+        14,
+        14,
+        14,
+        14,
+        14,
+        15,
+    ]
+    assert {name for group in groups for name in group.layer_names} == set(specs)
+
+
+def test_hybrid_group_size_override_rejects_invalid_value(monkeypatch):
+    monkeypatch.setenv("VLLM_KV_CACHE_GROUP_SIZE_OVERRIDE", "0")
+    specs = {
+        "attn": new_kv_cache_spec(),
+        "mamba": new_mamba_spec(),
+    }
+    with pytest.raises(ValueError, match="must be between 1 and"):
+        kv_cache_utils._get_kv_cache_groups_uniform_page_size(specs)
+
+
 def test_get_kv_cache_configs_attention_free():
     kv_cache_specs: dict[str, KVCacheSpec] = {}
     vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))

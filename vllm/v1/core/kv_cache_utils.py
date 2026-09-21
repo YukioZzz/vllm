@@ -1552,6 +1552,24 @@ def _get_kv_cache_groups_uniform_page_size(
         # layers while accommodating speculative decoding drafters that add
         # extra layers to one attention type.
         group_size = max_num_layers
+    if override := os.getenv("VLLM_KV_CACHE_GROUP_SIZE_OVERRIDE"):
+        try:
+            group_size = int(override)
+        except ValueError as exc:
+            raise ValueError(
+                "VLLM_KV_CACHE_GROUP_SIZE_OVERRIDE must be an integer, "
+                f"got {override!r}"
+            ) from exc
+        if not 1 <= group_size <= max_num_layers:
+            raise ValueError(
+                "VLLM_KV_CACHE_GROUP_SIZE_OVERRIDE must be between 1 and "
+                f"{max_num_layers}, got {group_size}"
+            )
+        logger.warning(
+            "Overriding hybrid KV cache group size to %d for layer counts %s",
+            group_size,
+            [len(layers) for layers in layer_buckets],
+        )
     grouped_layers = []
     for layers in layer_buckets:
         num_padding_layers = group_size - len(layers) % group_size
