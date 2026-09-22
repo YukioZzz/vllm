@@ -732,6 +732,23 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         # persistent gate below and makes aiter raise a KeyError mid-run.
         self._mtp_decode_qlen = self.reorder_batch_threshold or 1
 
+        # The scheduler reorder threshold is 1 + 2 * K for parallel DSpark
+        # drafting, but no single attention call is ever that wide: the draft
+        # pass issues K queries and target verification at most 1 + K. AITER
+        # sizes its fp32 partial-output workspace quadratically in the qlen it
+        # is given, so handing it the reorder threshold wastes tens of GiB that
+        # come straight out of the KV pool.
+        self._persistent_metadata_max_qo_len = self._mtp_decode_qlen
+        speculative_config = vllm_config.speculative_config
+        if (
+            speculative_config is not None
+            and speculative_config.method == "dspark"
+            and speculative_config.num_speculative_tokens is not None
+        ):
+            self._persistent_metadata_max_qo_len = (
+                1 + speculative_config.num_speculative_tokens
+            )
+
         # The cprr kernel starts at _MIN_CPRR_QLEN, and the per-step gate in
         # _forward_decode omits the global-position window below it: correct
         # for qlen 1 (a decode row sees every local token) but WRONG for qlen
@@ -830,7 +847,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             (reduce_partial_map_size, reduce_partial_map_type),
         ) = get_mla_metadata_info_v1(
             max_num_reqs,
-            self._mtp_decode_qlen,
+            self._persistent_metadata_max_qo_len,
             self._num_attention_heads,
             q_dtype,
             kv_dtype,
@@ -1461,7 +1478,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
                 or is_quantized_kv_cache(self._kv_cache_dtype_str)
             )
             and max_qo_len >= 1
-            and max_qo_len <= self._mtp_decode_qlen
+            and max_qo_len <= self._persistent_metadata_max_qo_len
         )
         if (
             not causal
