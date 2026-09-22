@@ -661,7 +661,32 @@ class KimiDecoderLayer(nn.Module):
         return prefix_sum, block_residual
 
 
+def _k3_spec_needs_target_embed(vllm_config) -> bool:
+    # Keep the target embedding on the last PP stage for the DSpark draft.
+    # The DSpark draft runs on the last PP stage and aliases the target's input
+    # embedding, but ROCm loads this module rather than the NVIDIA one, so the
+    # last stage otherwise keeps a PPMissingLayer and draft load dies with
+    # "needs the target input embedding, but it is unavailable on this PP
+    # stage". Prefer the upstream helper where the build has it.
+    try:
+        from vllm.model_executor.models.utils import spec_decode_needs_target_embed
+    except ImportError:
+        pass
+    else:
+        return spec_decode_needs_target_embed(vllm_config)
+
+    from vllm.distributed.parallel_state import get_pp_group
+
+    if getattr(vllm_config, "speculative_config", None) is None:
+        return False
+    pp_group = get_pp_group()
+    return pp_group.world_size > 1 and pp_group.is_last_rank
+
+
 class KimiLinearModel(nn.Module, EagleModelMixin):
+    # Relay DSpark auxiliary hidden states through pipeline stages.
+    supports_aux_hidden_states_over_pp = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -670,7 +695,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
 
         self.vocab_size = config.vocab_size
 
-        if get_pp_group().is_first_rank:
+        if get_pp_group().is_first_rank or _k3_spec_needs_target_embed(vllm_config):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -775,9 +800,17 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        aux_hidden_states = self._maybe_add_hidden_state(
-            [], self.start_layer, hidden_states, residual
-        )
+        # Recover auxiliary states captured on earlier pipeline stages.
+        remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
+
+        # The previous stage already transports the boundary tap matching
+        # this stage's start layer. Seed it only on the first pipeline rank to
+        # avoid returning the boundary feature twice.
+        aux_hidden_states: list[torch.Tensor] = []
+        if get_pp_group().is_first_rank:
+            aux_hidden_states = self._maybe_add_hidden_state(
+                aux_hidden_states, self.start_layer, hidden_states, residual
+            )
 
         if self.config.attn_res_block_size is None:
             for layer_idx, layer in enumerate(
@@ -795,13 +828,18 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
 
             if not get_pp_group().is_last_rank:
                 return IntermediateTensors(
-                    {"hidden_states": hidden_states, "residual": residual}
+                    {
+                        "hidden_states": hidden_states,
+                        "residual": residual,
+                        **self.pack_local_aux_hidden_states(aux_hidden_states),
+                    }
                 )
 
             # NOTE: the final norm is applied in compute_logits instead of here,
             # so the MTP draft model receives the pre-norm hidden states.
             if residual is not None:
                 hidden_states = hidden_states + residual
+            aux_hidden_states = remote_aux + aux_hidden_states
             if aux_hidden_states:
                 return hidden_states, aux_hidden_states
             return hidden_states
@@ -832,7 +870,11 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
+                {
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                    **self.pack_local_aux_hidden_states(aux_hidden_states),
+                }
             )
 
         hidden_states = _apply_attn_res(
@@ -844,6 +886,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
         )
         # NOTE: the final norm is applied in compute_logits instead of here, so
         # the MTP draft model receives the pre-norm hidden states.
+        aux_hidden_states = remote_aux + aux_hidden_states
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
@@ -1042,7 +1085,9 @@ class KimiLinearForCausalLM(
         vllm_config: "VllmConfig",
     ) -> tuple[torch.dtype, torch.dtype]:
         return MambaStateDtypeCalculator.kda_state_dtype(
-            vllm_config.model_config.dtype, vllm_config.cache_config.mamba_cache_dtype
+            vllm_config.model_config.dtype,
+            vllm_config.cache_config.mamba_cache_dtype,
+            vllm_config.cache_config.mamba_ssm_cache_dtype,
         )
 
     @classmethod

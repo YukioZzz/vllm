@@ -1144,12 +1144,24 @@ class GroupCoordinator:
             handles[0].wait()
             pending.popleft()
 
+    def drain_pending_isends(self) -> None:
+        """Wait for and release all retained tensor-dict sends."""
+        pending = getattr(self, "_pending_isends", None)
+        if pending is None:
+            return
+        while pending:
+            handles, _ = pending.popleft()
+            for handle in handles:
+                handle.wait()
+
     def isend_tensor_dict(
         self,
         tensor_dict: dict[str, torch.Tensor | Any],
         dst: int | None = None,
         all_gather_group: "GroupCoordinator | None" = None,
         all_gather_tensors: dict[str, bool] | None = None,
+        device_group: ProcessGroup | None = None,
+        send_all_gather_metadata: bool = False,
     ) -> list[Handle]:
         """Send the input tensor dictionary asynchronously.
 
@@ -1182,13 +1194,32 @@ class GroupCoordinator:
             0 if all_gather_group is None else all_gather_group.rank_in_group
         )
 
-        group = self.device_group
+        group = self.device_group if device_group is None else device_group
         metadata_group = self.cpu_group
 
         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
 
         tensor_keys = [k for k, v in tensor_dict.items() if isinstance(v, torch.Tensor)]
         assert len(tensor_keys) == len(tensor_list)
+        if send_all_gather_metadata:
+            # K3 sender-metadata PP receive prepost: the receiver may run before its next scheduler call,
+            # so carry the sender's per-key shard decision with the schema.
+            if any(key == "__k3_pp_sender_all_gather__" for key, _ in metadata_list):
+                raise ValueError("reserved PP sender metadata key")
+            metadata_list.append(
+                (
+                    "__k3_pp_sender_all_gather__",
+                    {
+                        key: self._should_use_all_gather(
+                            key,
+                            tensor.numel(),
+                            all_gather_group,
+                            all_gather_tensors,
+                        )
+                        for key, tensor in zip(tensor_keys, tensor_list)
+                    },
+                )
+            )
 
         # Reap completed sends before posting new ones, bounding the
         # self-retention FIFO.
@@ -1271,6 +1302,8 @@ class GroupCoordinator:
         src: int | None = None,
         all_gather_group: "GroupCoordinator | None" = None,
         all_gather_tensors: dict[str, bool] | None = None,
+        device_group: ProcessGroup | None = None,
+        use_sender_all_gather_metadata: bool = False,
     ) -> tuple[
         dict[str, torch.Tensor | Any] | None,
         list[Handle],
@@ -1297,10 +1330,29 @@ class GroupCoordinator:
             0 if all_gather_group is None else all_gather_group.rank_in_group
         )
 
-        group = self.device_group
+        group = self.device_group if device_group is None else device_group
         metadata_group = self.cpu_group
 
         recv_metadata_list = self.recv_object(src=src)
+        if use_sender_all_gather_metadata:
+            # K3 sender-metadata PP receive prepost: use the policy that shaped the sender's wire payload.
+            # This preserves TP shard/all-gather correctness without needing
+            # the next SchedulerOutput in the prepost thread.
+            policy_entries = [
+                value
+                for key, value in recv_metadata_list
+                if key == "__k3_pp_sender_all_gather__"
+            ]
+            if len(policy_entries) != 1:
+                raise RuntimeError(
+                    "preposted PP receive requires exactly one sender policy"
+                )
+            all_gather_tensors = policy_entries[0]
+            recv_metadata_list = [
+                (key, value)
+                for key, value in recv_metadata_list
+                if key != "__k3_pp_sender_all_gather__"
+            ]
         tensor_dict: dict[str, Any] = {}
         handles: list[Handle] = []
         postprocess: list[Callable[[], None]] = []

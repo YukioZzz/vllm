@@ -6,6 +6,7 @@ import gc
 import os
 import time
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from datetime import timedelta
 from types import NoneType
@@ -227,6 +228,25 @@ class Worker(WorkerBase):
 
         # Device handles of the previous step's PP intermediate-tensor send.
         self._pp_send_work: list[Handle] = []
+        # K3 dynamic TP8 PP activation ring: opt-in dynamic-schema sender ring.
+        self._pp_async_activation_enabled = (
+            os.environ.get("K3_PP_ASYNC_ACTIVATION", "0") == "1"
+        )
+        self._pp_activation_group = None
+        self._pp_activation_stream = None
+        self._pp_activation_slots: list[dict[str, torch.Tensor] | None] = [
+            None,
+            None,
+        ]
+        self._pp_activation_slot_work: list[list[Handle]] = [[], []]
+        self._pp_activation_slot_events: list[torch.cuda.Event] = []
+        self._pp_activation_slot_index = 0
+        # K3 sender-metadata PP receive prepost
+        self._pp_prepost_recv_enabled = (
+            os.environ.get("K3_PP_PREPOST_RECV", "0") == "1"
+        )
+        self._pp_prepost_executor: ThreadPoolExecutor | None = None
+        self._pp_prepost_future: Future | None = None
 
         # Resolved lazily on first sleep/wake; persists worker-process state.
         self._sleep_mode_backend: SleepModeBackend | None = None
@@ -443,6 +463,49 @@ class Worker(WorkerBase):
 
             if self.use_v2_model_runner:
                 logger.info_once("Using V2 Model Runner")
+
+            if self._pp_prepost_recv_enabled:
+                if not self._pp_async_activation_enabled:
+                    raise ValueError(
+                        "K3_PP_PREPOST_RECV requires K3_PP_ASYNC_ACTIVATION=1"
+                    )
+                if self.parallel_config.pipeline_parallel_size != 2:
+                    raise ValueError("K3 PP receive prepost currently requires PP2")
+
+            if self._pp_async_activation_enabled:
+                if not self.use_v2_model_runner:
+                    raise ValueError("K3 async PP activation requires MRV2")
+                if self.parallel_config.pipeline_parallel_size != 2:
+                    raise ValueError("K3 async PP activation currently requires PP2")
+                # K3 dynamic TP8 PP activation ring: every rank collectively creates the same sibling
+                # PP groups; each worker retains the group for its TP lane.
+                self._pp_activation_group = (
+                    get_pp_group().make_sibling_device_group(
+                        group_desc="k3_pp_activation"
+                    )
+                )
+                self._pp_activation_stream = torch.cuda.Stream(device=self.device)
+                self._pp_activation_slot_events = [
+                    torch.cuda.Event(),
+                    torch.cuda.Event(),
+                ]
+                logger.info_once("Enabled K3 dynamic TP8 PP activation ring")
+                if (
+                    self._pp_prepost_recv_enabled
+                    and get_pp_group().is_last_rank
+                ):
+                    self._pp_prepost_executor = ThreadPoolExecutor(
+                        max_workers=1,
+                        thread_name_prefix="k3-pp-recv",
+                    )
+                    # scope="process": this only ever runs on the last PP
+                    # stage, while the default "local" scope prints on the
+                    # node's first rank, so the default would make the feature
+                    # unobservable on any single-node deployment.
+                    logger.info_once(
+                        "Enabled K3 sender-metadata PP receive prepost",
+                        scope="process",
+                    )
 
             # Set random seed.
             set_random_seed(self.model_config.seed)
@@ -1143,6 +1206,144 @@ class Worker(WorkerBase):
             )
         return self.profiler.annotate_context_manager(annotation)
 
+    def _drain_pp_async_activation(self) -> None:
+        # K3 dynamic TP8 PP activation ring
+        for handles in self._pp_activation_slot_work:
+            for handle in handles:
+                handle.wait()
+            handles.clear()
+        if self._pp_async_activation_enabled:
+            get_pp_group().drain_pending_isends()
+
+    def _recv_pp_preposted_activation(
+        self,
+    ) -> tuple[
+        dict[str, torch.Tensor],
+        list[Handle],
+        list[Callable[[], None]],
+    ]:
+        # K3 sender-metadata PP receive prepost: this runs while PP1 is outside its next execute_model.
+        assert self._pp_activation_group is not None
+        assert self._pp_activation_stream is not None
+        torch.cuda.set_device(self.device)
+        with torch.cuda.stream(self._pp_activation_stream):
+            tensor_dict, handles, postprocess = (
+                get_pp_group().irecv_tensor_dict(
+                    all_gather_group=get_tp_group(),
+                    device_group=self._pp_activation_group,
+                    use_sender_all_gather_metadata=True,
+                )
+            )
+        assert tensor_dict is not None
+        return tensor_dict, handles, postprocess
+
+    def _start_pp_preposted_activation(self) -> None:
+        if not self._pp_prepost_recv_enabled:
+            return
+        if self._pp_prepost_future is not None:
+            raise RuntimeError("PP receive prepost already pending")
+        assert self._pp_prepost_executor is not None
+        self._pp_prepost_future = self._pp_prepost_executor.submit(
+            self._recv_pp_preposted_activation
+        )
+
+    def _take_pp_preposted_activation(
+        self,
+    ) -> tuple[
+        dict[str, torch.Tensor],
+        list[Handle],
+        list[Callable[[], None]],
+    ]:
+        # The first forward has no predecessor from which to prepost.
+        if self._pp_prepost_future is None:
+            return self._recv_pp_preposted_activation()
+        future = self._pp_prepost_future
+        self._pp_prepost_future = None
+        result = future.result()
+        if result[0].pop("__k3_pp_prepost_stop__", False):
+            raise RuntimeError("PP receive prepost stopped before execute_model")
+        return result
+
+    def _shutdown_pp_preposted_activation(self) -> None:
+        if not self._pp_prepost_recv_enabled:
+            return
+        pp_group = get_pp_group()
+        if pp_group.is_first_rank:
+            # Release the final PP1 metadata receive. Include a policy entry so
+            # the normal metadata parser remains the only receive path.
+            handle = pp_group.isend_object(
+                [
+                    ("__k3_pp_prepost_stop__", True),
+                    ("__k3_pp_sender_all_gather__", {}),
+                ],
+                dst=1,
+            )
+            handle.wait()
+            return
+
+        # There can be no prepost after a no-forward first step. Start one so
+        # the sender's shutdown sentinel always has a matching receive.
+        if self._pp_prepost_future is None:
+            self._start_pp_preposted_activation()
+        while self._pp_prepost_future is not None:
+            future = self._pp_prepost_future
+            self._pp_prepost_future = None
+            tensor_dict, handles, postprocess = future.result()
+            for handle in handles:
+                handle.wait()
+            for fn in postprocess:
+                fn()
+            if tensor_dict.pop("__k3_pp_prepost_stop__", False):
+                break
+            # Drain an unexpected queued activation, then receive the sentinel.
+            self._start_pp_preposted_activation()
+        assert self._pp_prepost_executor is not None
+        self._pp_prepost_executor.shutdown(wait=True)
+        self._pp_prepost_executor = None
+
+    def _send_pp_async_activation(
+        self,
+        tensors: dict[str, torch.Tensor],
+        all_gather_tensors: dict[str, bool],
+    ) -> None:
+        assert self._pp_activation_group is not None
+        assert self._pp_activation_stream is not None
+        index = self._pp_activation_slot_index
+        for handle in self._pp_activation_slot_work[index]:
+            handle.wait()
+        self._pp_activation_slot_work[index] = []
+
+        slot = self._pp_activation_slots[index]
+        schema = tuple(
+            (key, tensor.shape, tensor.dtype, tensor.device)
+            for key, tensor in sorted(tensors.items())
+        )
+        if slot is None or tuple(
+            (key, tensor.shape, tensor.dtype, tensor.device)
+            for key, tensor in sorted(slot.items())
+        ) != schema:
+            slot = {key: torch.empty_like(tensor) for key, tensor in tensors.items()}
+            self._pp_activation_slots[index] = slot
+
+        # Copy static CUDA-graph outputs on the main stream before it can run
+        # the next forward and overwrite those addresses.
+        for key, tensor in tensors.items():
+            slot[key].copy_(tensor)
+        event = self._pp_activation_slot_events[index]
+        event.record(torch.cuda.current_stream(self.device))
+        with torch.cuda.stream(self._pp_activation_stream):
+            self._pp_activation_stream.wait_event(event)
+            self._pp_activation_slot_work[index] = (
+                get_pp_group().isend_tensor_dict(
+                    slot,
+                    all_gather_group=get_tp_group(),
+                    all_gather_tensors=all_gather_tensors,
+                    device_group=self._pp_activation_group,
+                    send_all_gather_metadata=self._pp_prepost_recv_enabled,
+                )
+            )
+        self._pp_activation_slot_index = (index + 1) % 2
+
     @torch.inference_mode()
     @with_gpu_sync_check
     def sample_tokens(
@@ -1199,12 +1400,32 @@ class Worker(WorkerBase):
             }
 
         if forward_pass and not get_pp_group().is_first_rank:
-            tensor_dict, comm_handles, comm_postprocess = (
-                get_pp_group().irecv_tensor_dict(
-                    all_gather_group=get_tp_group(),
-                    all_gather_tensors=all_gather_tensors,
+            if self._pp_async_activation_enabled:
+                # K3 dynamic TP8 PP activation ring: post P2P receives on the sibling communication
+                # stream, preserving the existing TP shard/all-gather path.
+                assert self._pp_activation_group is not None
+                assert self._pp_activation_stream is not None
+                if self._pp_prepost_recv_enabled:
+                    # K3 sender-metadata PP receive prepost
+                    tensor_dict, comm_handles, comm_postprocess = (
+                        self._take_pp_preposted_activation()
+                    )
+                else:
+                    with torch.cuda.stream(self._pp_activation_stream):
+                        tensor_dict, comm_handles, comm_postprocess = (
+                            get_pp_group().irecv_tensor_dict(
+                                all_gather_group=get_tp_group(),
+                                all_gather_tensors=all_gather_tensors,
+                                device_group=self._pp_activation_group,
+                            )
+                        )
+            else:
+                tensor_dict, comm_handles, comm_postprocess = (
+                    get_pp_group().irecv_tensor_dict(
+                        all_gather_group=get_tp_group(),
+                        all_gather_tensors=all_gather_tensors,
+                    )
                 )
-            )
             assert tensor_dict is not None
             intermediate_tensors = AsyncIntermediateTensors(
                 tensor_dict,
@@ -1225,6 +1446,13 @@ class Worker(WorkerBase):
             if isinstance(
                 output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
             ):
+                if (
+                    self._pp_prepost_recv_enabled
+                    and forward_pass
+                    and get_pp_group().is_last_rank
+                ):
+                    # K3 sender-metadata PP receive prepost: arm the next receive before returning PP1.
+                    self._start_pp_preposted_activation()
                 return output
 
         assert isinstance(output, IntermediateTensors)
@@ -1234,15 +1462,19 @@ class Worker(WorkerBase):
             and not get_pp_group().is_last_rank
         )
 
-        # Non-blocking send of the intermediate tensors. The metadata handle
-        # is reaped lazily by the GroupCoordinator; the device handles are
-        # waited at the top of the next step.
-        handles = get_pp_group().isend_tensor_dict(
-            output.tensors,
-            all_gather_group=get_tp_group(),
-            all_gather_tensors=all_gather_tensors,
-        )
-        self._pp_send_work = handles[1:]
+        if self._pp_async_activation_enabled:
+            # K3 dynamic TP8 PP activation ring
+            self._send_pp_async_activation(output.tensors, all_gather_tensors)
+        else:
+            # Non-blocking send of the intermediate tensors. The metadata handle
+            # is reaped lazily by the GroupCoordinator; the device handles are
+            # waited at the top of the next step.
+            handles = get_pp_group().isend_tensor_dict(
+                output.tensors,
+                all_gather_group=get_tp_group(),
+                all_gather_tensors=all_gather_tensors,
+            )
+            self._pp_send_work = handles[1:]
 
         if self.use_v2_model_runner and self.model_runner.is_pooling_model:
             return self.model_runner.pool()  # type: ignore
@@ -1483,6 +1715,9 @@ class Worker(WorkerBase):
             self.model_runner.reset_lora_state()
 
     def shutdown(self) -> None:
+        # K3 sender-metadata PP receive prepost: release/drain the receiver before destroying groups.
+        self._shutdown_pp_preposted_activation()
+        self._drain_pp_async_activation()
         gc.unfreeze()
 
         # has_kv_transfer_group can be None during interpreter shutdown.

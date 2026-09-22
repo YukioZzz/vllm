@@ -62,6 +62,9 @@ class KimiK3ForConditionalGeneration(
     HasInnerState,
     IsHybrid,
 ):
+    # Relay DSpark auxiliary hidden states through pipeline stages.
+    supports_aux_hidden_states_over_pp = True
+
     """Kimi-K3 model with Kimi-K2.5 vision and KimiLinear text."""
 
     supports_encoder_tp_data = True

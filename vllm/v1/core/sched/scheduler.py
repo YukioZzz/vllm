@@ -1,7 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
+
+# K3 Mamba-align admission reservation: A/B switch so both arms share one image and differ only by an
+# environment variable.
+K3_ALIGN_ADMISSION_FIX = os.environ.get("K3_ALIGN_ADMISSION_FIX", "1") == "1"
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
@@ -546,6 +551,50 @@ class Scheduler(SchedulerInterface):
         )
         return blocks, num_local, shared_prefix_boundary, False
 
+    def _num_pending_admission(self) -> int:
+        """Requests that want to be admitted, across both waiting queues.
+
+        `skipped_waiting` holds requests a previous step could not place; they
+        are still candidates, and the WAITING loop's own condition treats the
+        two queues as one.
+        """
+        return len(self.waiting) + len(self.skipped_waiting)
+
+    def _reserve_admission_block(
+        self,
+        num_new_tokens: int,
+        budget: int,
+        num_others_waiting: int,
+        input_budget: int = 0,
+        draft_slots: int = 0,
+    ) -> int:
+        """Hold one block back so the next admission can still be aligned.
+
+        In Mamba "align" mode a prefill chunk must be a whole number of blocks.
+        A request allowed to take every block in the budget leaves a remainder
+        that is by construction smaller than a block, so every waiting request
+        is clipped to zero and nothing new is admitted until that prefill ends.
+        With agentic-length prompts that is hundreds of steps.
+
+        The reservation is taken against the budget the *next* admission will
+        see: `min(token_budget, input_budget - draft_slots)`, where each
+        already-scheduled request has cost `input_budget` an extra
+        `draft_slots`. Reserving out of `token_budget` alone leaves the next
+        admission `2 * draft_slots` below a whole block. Without speculative
+        decoding `draft_slots` is 0 and the two budgets coincide.
+        """
+        if not K3_ALIGN_ADMISSION_FIX:
+            return num_new_tokens
+        if not self.need_mamba_block_aligned_split or num_others_waiting == 0:
+            return num_new_tokens
+        block_size = self.cache_config.block_size
+        if num_new_tokens <= block_size:
+            # A decode, or a chunk already no larger than the reservation.
+            return num_new_tokens
+        if draft_slots:
+            budget = min(budget, input_budget - 2 * draft_slots)
+        return min(num_new_tokens, max(budget - block_size, block_size))
+
     def _reserve_prefill_lookahead(
         self,
         request: Request,
@@ -684,6 +733,13 @@ class Scheduler(SchedulerInterface):
 
             # Apply Mamba alignment before encoder caps.
             if self.need_mamba_block_aligned_split:
+                num_new_tokens = self._reserve_admission_block(
+                    num_new_tokens,
+                    token_budget,
+                    self._num_pending_admission(),
+                    input_budget,
+                    draft_slots,
+                )
                 num_new_tokens = self._mamba_block_aligned_split(
                     request, num_new_tokens
                 )
@@ -1126,6 +1182,17 @@ class Scheduler(SchedulerInterface):
 
                     # Apply Mamba alignment before encoder caps.
                     if self.need_mamba_block_aligned_split:
+                        # This request is itself queued; only hold a block back
+                        # if somebody else is waiting behind it.
+                        # request_token_budget already carries one draft_slots
+                        # charge, so pass it as both budgets.
+                        num_new_tokens = self._reserve_admission_block(
+                            num_new_tokens,
+                            request_token_budget,
+                            self._num_pending_admission() - 1,
+                            request_token_budget + draft_slots,
+                            draft_slots,
+                        )
                         num_new_tokens = self._mamba_block_aligned_split(
                             request,
                             num_new_tokens,
@@ -1133,7 +1200,18 @@ class Scheduler(SchedulerInterface):
                             num_external_computed_tokens,
                         )
                         if num_new_tokens == 0:
-                            break
+                            # The remaining budget cannot hold a block-aligned
+                            # chunk for *this* request. That is a statement
+                            # about this request's alignment, not about the
+                            # budget being spent, so skip it and try the next
+                            # one -- same reasoning as the `continue` in the
+                            # RUNNING loop. Breaking here lets one unalignable
+                            # request stall the whole queue for the step.
+                            if not K3_ALIGN_ADMISSION_FIX:
+                                break
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
+                            continue
                         if (
                             pad_spec_decode
                             and num_new_tokens != 1 + self.num_spec_tokens

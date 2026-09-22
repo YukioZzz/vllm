@@ -102,12 +102,25 @@ class KVCacheCoordinator(ABC):
         )
 
         # KV cache group indices that get the EAGLE last-block drop.
-        self.eagle_group_ids: set[int] = {
-            i for i, g in enumerate(kv_cache_config.kv_cache_groups) if g.is_eagle_group
-        }
+        self.eagle_group_ids: set[int] = (
+            {
+                i
+                for i, g in enumerate(kv_cache_config.kv_cache_groups)
+                if g.is_eagle_group
+            }
+            if use_eagle
+            else set()
+        )
         # Conservatively fall back to flag all groups when no group is flagged.
         if use_eagle and not self.eagle_group_ids:
             self.eagle_group_ids = set(range(len(kv_cache_config.kv_cache_groups)))
+
+        logger.warning(
+            "K3 DSpark coordinator eagle groups: use_eagle=%s ids=%s flags=%s",
+            use_eagle,
+            sorted(self.eagle_group_ids),
+            [group.is_eagle_group for group in kv_cache_config.kv_cache_groups],
+        )
 
         # During chunked prefill with EAGLE, the single next prefill lookahead
         # token past the chunk boundary is combined with the final hidden state
