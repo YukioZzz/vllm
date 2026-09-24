@@ -221,7 +221,10 @@ def _get_aiter_mla_decode():
 
 @functools.lru_cache(maxsize=1)
 def _aiter_mla_external_workspace_supported() -> bool:
-    parameters = inspect.signature(_get_aiter_mla_decode()).parameters
+    try:
+        parameters = inspect.signature(_get_aiter_mla_decode()).parameters
+    except (TypeError, ValueError):
+        return False
     return {
         "logits_buffer",
         "attn_lse_buffer",

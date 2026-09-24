@@ -673,6 +673,11 @@ def test_single_token_dcp_decode_reuses_workspace(monkeypatch):
         dcp_verify=None,
         has_persistent_metadata=True,
         attn_out_dtype=torch.bfloat16,
+        asm_decode_num_heads=0,
+        g_kv_indptr=None,
+        cp_world_size=1,
+        cp_rank=0,
+        mla_num_kv_splits=0,
     )
     metadata_buffers = {
         "work_meta_data": torch.empty(1, dtype=torch.int32),
@@ -699,6 +704,15 @@ def test_single_token_dcp_decode_reuses_workspace(monkeypatch):
     assert tuple(tensor.shape for tensor in captured["buffers"]) == tuple(
         shape for shape, _ in expected_specs
     )
+
+
+def test_external_workspace_probe_fails_closed(monkeypatch):
+    monkeypatch.setattr(rocm_aiter_mla, "_get_aiter_mla_decode", lambda: object())
+    rocm_aiter_mla._aiter_mla_external_workspace_supported.cache_clear()
+
+    assert not rocm_aiter_mla._aiter_mla_external_workspace_supported()
+
+    rocm_aiter_mla._aiter_mla_external_workspace_supported.cache_clear()
 
 
 def test_verify_partial_attention_merge():

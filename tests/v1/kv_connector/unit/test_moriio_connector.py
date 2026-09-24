@@ -932,6 +932,8 @@ def test_worker_layer_to_group_routing(mock_parallel_groups):
             kv_cache_config=_make_hybrid_kv_cache_config(),
         )
     assert worker.layer_to_group == {"full0": 0, "sw0": 1}
+
+
 def test_mamba_reads_apply_shared_mr_region_offsets():
     worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
     worker.kv_region_mr_offsets = {"kda": [100, 200]}
