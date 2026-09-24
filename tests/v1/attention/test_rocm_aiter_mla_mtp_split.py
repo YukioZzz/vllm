@@ -19,6 +19,7 @@ from vllm.v1.attention.backends.mla.rocm_aiter_mla import (  # noqa: E402
     AiterMLAHelper,
     AiterMLAImpl,
     AiterMLAMetadataBuilder,
+    _aiter_decode_workspace_specs,
 )
 from vllm.v1.attention.ops.rocm_aiter_mla_merge import (  # noqa: E402
     merge_mla_segments_triton,
@@ -342,6 +343,91 @@ def test_single_token_dcp_decode_returns_unpadded_lse(monkeypatch):
     assert lse is not None
     assert output.shape[1] == decode_heads
     assert lse.shape == (num_tokens, decode_heads)
+
+
+def test_single_token_dcp_decode_reuses_workspace(monkeypatch):
+    num_heads, dcp_world_size = 6, 2
+    decode_heads = num_heads * dcp_world_size
+    padded_heads = 16
+    num_tokens, head_dim = 3, 576
+    num_partial_entries = 7
+    captured = {}
+
+    class FakeWorkspace:
+        def get_simultaneous(self, *specs):
+            captured["specs"] = specs
+            return [torch.empty(shape, dtype=dtype) for shape, dtype in specs]
+
+    def fake_aiter_decode(q, kv_buffer, out, *args, **kwargs):
+        captured["buffers"] = tuple(
+            kwargs[name]
+            for name in ("logits_buffer", "attn_lse_buffer", "final_lse_buffer")
+        )
+        return None, torch.zeros(num_tokens, q.shape[1])
+
+    monkeypatch.setattr(
+        rocm_aiter_mla, "_get_aiter_mla_decode", lambda: fake_aiter_decode
+    )
+    monkeypatch.setattr(
+        rocm_aiter_mla, "_aiter_mla_external_workspace_supported", lambda: True
+    )
+    monkeypatch.setattr(
+        "vllm.v1.worker.workspace.current_workspace_manager", lambda: FakeWorkspace()
+    )
+
+    impl = object.__new__(AiterMLAImpl)
+    impl.num_heads = num_heads
+    impl.dcp_world_size = dcp_world_size
+    impl.kv_cache_dtype = "auto"
+    impl.kv_lora_rank = 512
+    impl.qk_rope_head_dim = 64
+    impl.scale = head_dim**-0.5
+    decode = SimpleNamespace(
+        max_qo_len=1,
+        qo_indptr=torch.arange(num_tokens + 1, dtype=torch.int32),
+        paged_kv_indptr=torch.zeros(num_tokens + 1, dtype=torch.int32),
+        paged_kv_indices=torch.zeros(1, dtype=torch.int32),
+        paged_kv_last_page_len=torch.ones(num_tokens, dtype=torch.int32),
+        use_gluon_decode=False,
+        use_gluon_verify=False,
+        dcp_verify=None,
+        has_persistent_metadata=True,
+        attn_out_dtype=torch.bfloat16,
+    )
+    metadata_buffers = {
+        "work_meta_data": torch.empty(1, dtype=torch.int32),
+        "work_indptr": torch.empty(1, dtype=torch.int32),
+        "work_info_set": torch.empty(1, dtype=torch.int32),
+        "reduce_indptr": torch.empty(1, dtype=torch.int32),
+        "reduce_final_map": torch.empty(1, dtype=torch.int32),
+        "reduce_partial_map": torch.empty(num_partial_entries, dtype=torch.int32),
+    }
+    attn_metadata = SimpleNamespace(decode=decode, causal=True, **metadata_buffers)
+    layer = SimpleNamespace(_q_scale=torch.tensor(1.0), _k_scale=torch.tensor(1.0))
+
+    q = torch.zeros(num_tokens, decode_heads, head_dim, dtype=torch.bfloat16)
+    impl.forward_mqa(q, torch.zeros(1, 1, head_dim), attn_metadata, layer)
+
+    expected_specs = _aiter_decode_workspace_specs(
+        num_partial_entries,
+        1,
+        padded_heads,
+        512,
+        num_tokens,
+    )
+    assert captured["specs"] == expected_specs
+    assert tuple(tensor.shape for tensor in captured["buffers"]) == tuple(
+        shape for shape, _ in expected_specs
+    )
+
+
+def test_external_workspace_probe_fails_closed(monkeypatch):
+    monkeypatch.setattr(rocm_aiter_mla, "_get_aiter_mla_decode", lambda: object())
+    rocm_aiter_mla._aiter_mla_external_workspace_supported.cache_clear()
+
+    assert not rocm_aiter_mla._aiter_mla_external_workspace_supported()
+
+    rocm_aiter_mla._aiter_mla_external_workspace_supported.cache_clear()
 
 
 def test_verify_partial_attention_merge():
