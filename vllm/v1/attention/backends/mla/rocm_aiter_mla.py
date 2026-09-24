@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import functools
+import inspect
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Final
@@ -216,6 +217,31 @@ def _get_aiter_mla_decode():
     from aiter.mla import mla_decode_fwd
 
     return mla_decode_fwd
+
+
+@functools.lru_cache(maxsize=1)
+def _aiter_mla_external_workspace_supported() -> bool:
+    parameters = inspect.signature(_get_aiter_mla_decode()).parameters
+    return {
+        "logits_buffer",
+        "attn_lse_buffer",
+        "final_lse_buffer",
+    }.issubset(parameters)
+
+
+def _aiter_decode_workspace_specs(
+    num_partial_entries: int,
+    max_qo_len: int,
+    num_heads: int,
+    v_head_dim: int,
+    num_output_rows: int,
+) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
+    partial_rows = num_partial_entries * max_qo_len
+    return (
+        ((partial_rows, 1, num_heads, v_head_dim), torch.float32),
+        ((partial_rows, 1, num_heads, 1), torch.float32),
+        ((num_output_rows, num_heads), torch.float32),
+    )
 
 
 @functools.lru_cache(maxsize=1)
@@ -899,6 +925,18 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             dtype=reduce_partial_map_type,
             device=device,
         )
+        if self.dcp_world_size > 1 and _aiter_mla_external_workspace_supported():
+            from vllm.v1.worker.workspace import current_workspace_manager
+
+            current_workspace_manager().get_simultaneous(
+                *_aiter_decode_workspace_specs(
+                    reduce_partial_map_size,
+                    self._mtp_decode_qlen,
+                    self._num_attention_heads,
+                    self.mla_dims.v_head_dim,
+                    max_num_reqs * self._mtp_decode_qlen,
+                )
+            )
 
         # The assembly prefill requires FP8 KV, bf16 output, and 16-aligned
         # heads. It writes bf16 through a raw output pointer, so fp16 must use
@@ -2518,6 +2556,24 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
                 reduce_final_map=attn_metadata.reduce_final_map,
                 reduce_partial_map=attn_metadata.reduce_partial_map,
             )
+            if self.dcp_world_size > 1 and _aiter_mla_external_workspace_supported():
+                from vllm.v1.worker.workspace import current_workspace_manager
+
+                assert attn_metadata.reduce_partial_map is not None
+                workspace = current_workspace_manager().get_simultaneous(
+                    *_aiter_decode_workspace_specs(
+                        attn_metadata.reduce_partial_map.size(0),
+                        int(decode.max_qo_len),
+                        mla_num_heads,
+                        self.kv_lora_rank,
+                        B,
+                    )
+                )
+                mla_kwargs.update(
+                    logits_buffer=workspace[0],
+                    attn_lse_buffer=workspace[1],
+                    final_lse_buffer=workspace[2],
+                )
 
         lse = None
         if self.dcp_world_size > 1:
