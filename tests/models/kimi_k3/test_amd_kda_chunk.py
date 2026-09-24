@@ -680,6 +680,27 @@ def test_paged_state_matches_the_dense_pair(
     )
 
 
+def test_fused_paged_bf16_state_matches_dense_pair() -> None:
+    """The FP32 fused walk may load and store a BF16 persistent cache."""
+    _requires_kernel()
+    seqlens = [513, 64, 1]
+    inp = _inputs(seqlens, seed=17)
+    rows = [2, 7, 11]
+    cache, idx, warm = _paged_cache(inp, [True] * len(seqlens), rows, slots=16)
+    cache = cache.to(torch.bfloat16)
+
+    dense = dict(inp)
+    dense["h0"] = cache[idx.long()].float()
+    o_ref, ht_ref = _run(dense, use_fused=True)
+    o_got, ht_got = _run_paged(inp, cache, idx, warm, use_fused=True)
+
+    assert ht_got is None
+    torch.testing.assert_close(o_got, o_ref, rtol=5e-3, atol=5e-3)
+    torch.testing.assert_close(
+        cache[idx.long()], ht_ref.to(torch.bfloat16), rtol=5e-3, atol=5e-3
+    )
+
+
 @pytest.mark.parametrize("use_fused", [False, True])
 def test_cold_rows_start_from_zero_not_from_cache_junk(use_fused: bool) -> None:
     """`has_initial_state=False` must ignore whatever the row already holds."""

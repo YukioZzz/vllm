@@ -120,7 +120,7 @@ def chunk_kda_prefill(
     # gathers the rows it needs and scatters the results back here, so callers
     # pass the cache the same way for either backend.
     scatter_to: torch.Tensor | None = None
-    if state_cache is not None and not fused:
+    if state_cache is not None and (not fused or state_cache.dtype != torch.float32):
         initial_state = gather_initial_states(
             state_cache, state_indices, has_initial_state
         )
@@ -131,6 +131,11 @@ def chunk_kda_prefill(
         # Restated for the type checker; `fused` already implies all three.
         assert cu_seqlens is not None and lower_bound is not None
         assert g_bias is not None
+        # The fused HIP prefill kernel accumulates recurrent state in FP32.
+        # Convert only active rows; the persistent cache keeps its configured
+        # dtype and receives a cast-back below.
+        if initial_state is not None and initial_state.dtype != torch.float32:
+            initial_state = initial_state.to(torch.float32)
         logger.info_once(
             "Kimi-K3 KDA prefill: dispatching the fused ROCm chunk kernel."
         )
@@ -147,7 +152,7 @@ def chunk_kda_prefill(
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
         )
-        return fused_kda_chunk(
+        o, final_state = fused_kda_chunk(
             qg=ws["qg"],
             w=ws["w"],
             u=ws["u"],
@@ -168,6 +173,11 @@ def chunk_kda_prefill(
             state_indices=state_indices,
             has_initial_state=has_initial_state,
         )
+        if scatter_to is not None:
+            assert state_indices is not None
+            scatter_to[state_indices.long()] = final_state.to(scatter_to.dtype)
+            return o, None
+        return o, final_state
 
     o, final_state = chunk_kda_with_fused_gate(
         q=q,
@@ -191,6 +201,6 @@ def chunk_kda_prefill(
         o = out
     if scatter_to is not None:
         assert state_indices is not None
-        scatter_to[state_indices.long()] = final_state
+        scatter_to[state_indices.long()] = final_state.to(scatter_to.dtype)
         return o, None
     return o, final_state
