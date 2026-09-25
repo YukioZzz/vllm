@@ -538,3 +538,37 @@ def test_request_scoped_failure_with_bad_group_count_recomputes_all():
     assert failed == set()
     assert request.num_computed_tokens == 0
     assert request.request_id in scheduler.failed_recving_kv_req_ids
+
+
+def test_request_scoped_sync_failure_discards_output_and_recomputes_suffix():
+    request = create_request(num_tokens=64)
+    request.status = RequestStatus.RUNNING
+    request.num_computed_tokens = 64
+    scheduler = _request_failure_scheduler(request)
+
+    failed = scheduler._handle_failed_recving(
+        {request.request_id},
+        {request.request_id: (set(), {8})},
+        {request.request_id: 16},
+    )
+
+    assert failed == {request.request_id}
+    assert request.num_computed_tokens == 32
+    assert request.request_id not in scheduler.failed_recving_kv_req_ids
+
+
+def test_request_scoped_sync_failure_honors_fail_policy():
+    request = create_request(num_tokens=64)
+    request.status = RequestStatus.RUNNING
+    request.num_computed_tokens = 64
+    scheduler = _request_failure_scheduler(request)
+    scheduler.recompute_kv_load_failures = False
+
+    failed = scheduler._handle_failed_recving(
+        {request.request_id},
+        {request.request_id: ({7}, {20})},
+        {request.request_id: 16},
+    )
+
+    assert failed == {request.request_id}
+    assert request.num_computed_tokens == 64

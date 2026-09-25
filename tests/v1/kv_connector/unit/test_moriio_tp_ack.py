@@ -13,6 +13,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector import (
     MoRIIOConnector,
+    MoRIIOConnectorScheduler,
     MoRIIOConnectorWorker,
     get_moriio_expected_ack_count,
     get_moriio_remote_tp_rank,
@@ -22,6 +23,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector import
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_engine import (
     MoRIIOWrapper,
 )
+from vllm.v1.outputs import KVConnectorOutput
 
 
 def test_remote_tp_rank_same_tp_maps_to_self():
@@ -409,7 +411,7 @@ def test_read_completion_waits_for_every_posted_read():
         "req": ("127.0.0.1", "7000", "tx-pending")
     }
     worker._recving_transfers_start = {"req": float("inf")}
-    worker._recving_local_blocks = {"req": [1, 2]}
+    worker._recving_local_blocks = {"req": ({1, 2},)}
     worker._invalid_block_ids = set()
 
     assert worker._pop_done_transfers() == set()
@@ -417,22 +419,32 @@ def test_read_completion_waits_for_every_posted_read():
     assert worker.moriio_wrapper.sent == []
 
 
-@pytest.mark.parametrize(
-    ("has_mamba", "expected_invalid"),
-    [(False, {1, 2}), (True, set())],
-)
-def test_failed_read_reports_blocks_only_without_hma(has_mamba, expected_invalid):
+@pytest.mark.parametrize("has_mamba", [False, True])
+def test_failed_read_preserves_request_and_group_identity_for_hma(has_mamba):
     worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
     worker._has_mamba = has_mamba
-    worker._recving_local_blocks = {"req": [1, 2]}
+    worker._recving_local_blocks = {"req": ({1, 2}, {3})}
     worker._invalid_block_ids = set()
+    worker._failed_recving = set()
+    worker._failed_recving_block_ids = {}
 
     worker._record_failed_recv("req")
 
-    assert worker.get_block_ids_with_load_errors() == expected_invalid
+    if has_mamba:
+        assert worker.get_block_ids_with_load_errors() == set()
+        assert worker._failed_recving == {"req"}
+        assert worker._failed_recving_block_ids == {"req": ({1, 2}, {3})}
+    else:
+        assert worker.get_block_ids_with_load_errors() == {1, 2, 3}
+        assert worker._failed_recving == set()
+        assert worker._failed_recving_block_ids == {}
 
 
-def test_hybrid_step_barrier_fails_closed(monkeypatch):
+def test_hybrid_step_barrier_keeps_ranks_in_collective_order(monkeypatch):
+    class FailedStatus:
+        def Failed(self):
+            return True
+
     class FailingWrapper:
         def waiting_for_transfer_complete(self, _statuses):
             raise TransferError("failed")
@@ -442,16 +454,115 @@ def test_hybrid_step_barrier_fails_closed(monkeypatch):
 
     worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
     worker._has_mamba = True
-    worker._reads_issued_this_step = [object()]
-    worker._mamba_reads_this_step = [object()]
+    worker._reads_issued_this_step = [FailedStatus()]
+    worker._mamba_reads_this_step = [FailedStatus()]
     worker.moriio_wrapper = FailingWrapper()
     monkeypatch.setattr(
         "vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector.get_forward_context",
         lambda: SimpleNamespace(cudagraph_runtime_mode=None),
     )
 
-    with pytest.raises(TransferError, match="failed"):
+    worker._await_reads_issued_this_step()
+
+    assert worker._reads_issued_this_step == []
+    assert worker._mamba_reads_this_step == []
+
+
+def test_hybrid_step_barrier_keeps_timeout_fail_closed(monkeypatch):
+    class PendingStatus:
+        def Failed(self):
+            return False
+
+    class TimingOutWrapper:
+        def waiting_for_transfer_complete(self, _statuses):
+            raise TransferError("timed out")
+
+        def shutdown(self):
+            pass
+
+    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker._has_mamba = True
+    worker._reads_issued_this_step = [PendingStatus()]
+    worker._mamba_reads_this_step = [PendingStatus()]
+    worker.moriio_wrapper = TimingOutWrapper()
+    monkeypatch.setattr(
+        "vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector.get_forward_context",
+        lambda: SimpleNamespace(cudagraph_runtime_mode=None),
+    )
+
+    with pytest.raises(TransferError, match="timed out"):
         worker._await_reads_issued_this_step()
+
+
+def test_hybrid_failed_read_reports_completion_and_grouped_blocks():
+    class FailedStatus:
+        def Succeeded(self):
+            return False
+
+        def Failed(self):
+            return True
+
+        def Message(self):
+            return "work request flushed"
+
+        def Code(self):
+            return 5
+
+    class FakeWrapper:
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.sent = []
+
+        poll_transfer_batch = MoRIIOWrapper.poll_transfer_batch
+
+        def send_notify(self, *args, **kwargs):
+            self.sent.append((args, kwargs))
+
+        def shutdown(self):
+            pass
+
+    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker.is_producer = False
+    worker.mode = MoRIIOMode.READ
+    worker.world_size = 8
+    worker._has_mamba = True
+    worker.moriio_config = SimpleNamespace(recv_abort_timeout=600.0)
+    worker.moriio_wrapper = FakeWrapper()
+    worker.transfer_id_to_request_id = {"tx-failed": "req"}
+    worker._recving_transfers = {"req": {"layer0": [FailedStatus()]}}
+    worker._recving_transfers_callback_addr = {
+        "req": ("127.0.0.1", "7000", "tx-failed")
+    }
+    worker._recving_transfers_start = {"req": 0.0}
+    worker._recving_local_blocks = {"req": ({1, 2}, {3})}
+    worker._invalid_block_ids = set()
+    worker._failed_recving = set()
+    worker._failed_recving_block_ids = {}
+
+    results = worker.get_transfer_results()
+
+    assert results.finished_recving == {"req"}
+    assert results.failed_recving == {"req"}
+    assert results.failed_recving_block_ids == {"req": ({1, 2}, {3})}
+    assert worker._failed_recving == set()
+    assert worker._failed_recving_block_ids == {}
+
+
+def test_read_scheduler_consumes_synchronous_completion_signal():
+    scheduler = MoRIIOConnectorScheduler.__new__(MoRIIOConnectorScheduler)
+    scheduler.is_producer = False
+    scheduler.mode = MoRIIOMode.READ
+    output = KVConnectorOutput(
+        finished_recving={"req"},
+        failed_recving={"req"},
+        failed_recving_block_ids={"req": ({1}, {2})},
+    )
+
+    scheduler.update_connector_output(output)
+
+    assert output.finished_recving is None
+    assert output.failed_recving == {"req"}
+    assert output.failed_recving_block_ids == {"req": ({1}, {2})}
 
 
 def test_requested_cudagraph_mode_is_never_overridden():

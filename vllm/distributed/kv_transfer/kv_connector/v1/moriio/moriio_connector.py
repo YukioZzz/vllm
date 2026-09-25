@@ -22,6 +22,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    KVConnectorTransferResults,
     SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
@@ -346,6 +347,13 @@ class MoRIIOConnector(KVConnectorBase_V1, SupportsHMA):
         """Get the finished recving and sending requests."""
         assert self.connector_worker is not None
         return self.connector_worker.get_finished()
+
+    def get_transfer_results(
+        self, finished_req_ids: set[str]
+    ) -> KVConnectorTransferResults:
+        """Return completed transfers and request-scoped READ failures."""
+        assert self.connector_worker is not None
+        return self.connector_worker.get_transfer_results()
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """Blocks whose MoRIIO read failed, for the scheduler to recompute."""
@@ -1465,11 +1473,18 @@ class MoRIIOConnectorScheduler:
           deadline is a stale duplicate (e.g. a real ACK landing after the
           send was already reaped) and is dropped.
 
-        Consumers never populate finished_sending (they report
-        finished_recving), and they unmap in request_finished, so this is a
-        no-op for them.
+        Consumers never populate finished_sending. READ consumers use their
+        synchronous finished_recving reports only as an all-worker failure
+        quorum, so this method consumes those reports before the generic
+        asynchronous scheduler path sees them.
         """
         if not self.is_producer:
+            if self.mode == MoRIIOMode.READ:
+                # Synchronous READ completions are emitted only to let the
+                # worker-output aggregator establish an all-rank failure
+                # quorum. The request is already RUNNING, so the generic
+                # async-completion path must not consume this signal.
+                connector_output.finished_recving = None
             return
 
         incoming = set(connector_output.finished_sending or ())
@@ -1717,11 +1732,13 @@ class MoRIIOConnectorWorker:
         # Used by _pop_done_transfers to abort transfers whose RDMA
         # completion is lost, instead of hanging forever.
         self._recving_transfers_start: dict[str, float] = {}
-        # Destination attention blocks per in-flight recv. Failed non-HMA reads
-        # report these to the scheduler's single-group recovery path.
-        self._recving_local_blocks: dict[ReqId, list[int]] = {}
+        # Destination blocks by cache group for each in-flight receive.
+        self._recving_local_blocks: dict[ReqId, tuple[set[int], ...]] = {}
         # Drained by get_block_ids_with_load_errors.
         self._invalid_block_ids: set[int] = set()
+        # HMA failures retain request and cache-group identity for the scheduler.
+        self._failed_recving: set[ReqId] = set()
+        self._failed_recving_block_ids: dict[ReqId, tuple[set[int], ...]] = {}
         # This step's posted reads, awaited before the forward when the
         # per-layer barrier cannot run.
         self._reads_issued_this_step: list = []
@@ -2638,14 +2655,11 @@ class MoRIIOConnectorWorker:
                 self._unmatched_write_completions |= fresh
                 done_recving = self._unmatched_write_completions
             else:
-                # READ mode: the scheduler treats KV loads as synchronous
-                # (load_kv_async=False), so requests go directly to RUNNING
-                # instead of WAITING_FOR_REMOTE_KVS. We still call
-                # _pop_done_transfers() to send the notify to the prefill
-                # side and clean up internal state, but we must NOT report
-                # these as done_recving because the scheduler doesn't
-                # expect a finished_recving signal for RUNNING requests.
-                self._pop_done_transfers()
+                # READ loads are synchronous, but reporting completion from
+                # every rank gives KVOutputAggregator a quorum for a failure
+                # observed by only one rank. The scheduler ignores successful
+                # completion signals for requests that are already RUNNING.
+                done_recving = self._pop_done_transfers()
 
         done_recving = {
             self.transfer_id_to_request_id[id]
@@ -2663,6 +2677,21 @@ class MoRIIOConnectorWorker:
             self._unmatched_write_completions -= matched_xfer_ids
 
         return done_sending, done_recving
+
+    def get_transfer_results(self) -> KVConnectorTransferResults:
+        """Return completions plus request/group-scoped READ failures."""
+        done_sending, done_recving = self.get_finished()
+        failed_recving, self._failed_recving = self._failed_recving, set()
+        failed_block_ids, self._failed_recving_block_ids = (
+            self._failed_recving_block_ids,
+            {},
+        )
+        return KVConnectorTransferResults(
+            finished_sending=done_sending,
+            finished_recving=done_recving,
+            failed_recving=failed_recving,
+            failed_recving_block_ids=failed_block_ids,
+        )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """Block until all in-flight READs of this layer have landed.
@@ -2688,16 +2717,14 @@ class MoRIIOConnectorWorker:
         try:
             self.moriio_wrapper.waiting_for_transfer_complete(pending)
         except TransferError:
-            if self._has_mamba:
-                logger.exception(
-                    "MoRIIO hybrid READ failed before layer %s; aborting the "
-                    "forward because HMA load-error recovery is unsupported.",
-                    layer_name,
-                )
+            if not any(status.Failed() for status in pending):
+                # A wait timeout can leave DMA in flight. Keep the existing
+                # fail-closed behavior until MoRIIO exposes cancellation.
                 raise
             logger.warning(
                 "MoRIIO READ barrier did not complete for layer %s; proceeding "
-                "to transfer cleanup.",
+                "with this step so all ranks remain in collective order; the "
+                "scheduler will discard affected request outputs.",
                 layer_name,
                 exc_info=True,
             )
@@ -2755,10 +2782,8 @@ class MoRIIOConnectorWorker:
                             "Failed to send error notification for request %s",
                             req_id,
                         )
+                    done_req_ids.add(xfer_id)
                     to_remove.append(req_id)
-                    # Deliberately not in done_req_ids: the decode KV is
-                    # incomplete, so this is a load error rather than a
-                    # completion.
                 elif req_id in self._recving_transfers_start:
                     # Abort still-in-flight transfers that exceed the
                     # configured deadline. Otherwise a lost RDMA
@@ -2799,11 +2824,9 @@ class MoRIIOConnectorWorker:
         start_load_kv runs outside the graph, so blocking here is safe.
         Attention reads keep their per-layer overlap in the non-FULL case.
 
-        Attention-only failures are reported via
-        get_block_ids_with_load_errors. Hybrid failures are re-raised because
-        the scheduler's recovery path does not support multiple cache groups;
-        this fails the step closed instead of running forward with incomplete
-        recurrent state.
+        Transfer failures are recorded after the forward. The sampled output
+        for affected requests is discarded by the scheduler; completing the
+        forward keeps every TP/DCP rank in the same collective sequence.
         """
         all_statuses = self._reads_issued_this_step
         self._reads_issued_this_step = []
@@ -2818,28 +2841,27 @@ class MoRIIOConnectorWorker:
         try:
             self.moriio_wrapper.waiting_for_transfer_complete(statuses)
         except TransferError:
-            if self._has_mamba:
-                logger.exception(
-                    "MoRIIO hybrid READ failed before the forward; aborting "
-                    "because HMA load-error recovery is unsupported."
-                )
+            if not any(status.Failed() for status in statuses):
+                # Do not recover a timeout by freeing blocks that an in-flight
+                # RDMA operation may still write into.
                 raise
             logger.exception(
-                "MoRIIO reads did not complete before the forward; proceeding "
-                "to transfer cleanup."
+                "MoRIIO reads did not complete before the forward; keeping "
+                "ranks in lockstep and discarding affected request outputs."
             )
 
     def _record_failed_recv(self, req_id: ReqId) -> None:
-        """Hand a failed attention-only read to scheduler recovery.
-
-        The scheduler's invalid-block recovery currently assumes exactly one
-        KV cache group. Reporting IDs for a hybrid request would crash it while
-        unpacking the request's groups, so match NIXL and keep HMA failures out
-        of this API until scheduler recovery carries group identity.
-        """
+        """Hand a failed READ to the appropriate scheduler recovery path."""
+        block_groups = self._recving_local_blocks.get(req_id, ())
         if self._has_mamba:
+            self._failed_recving.add(req_id)
+            self._failed_recving_block_ids[req_id] = tuple(
+                set(group) for group in block_groups
+            )
             return
-        self._invalid_block_ids.update(self._recving_local_blocks.get(req_id, ()))
+        self._invalid_block_ids.update(
+            block_id for group in block_groups for block_id in group
+        )
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """Drain the blocks whose read failed, for the scheduler to recompute."""
@@ -3704,15 +3726,11 @@ class MoRIIOConnectorWorker:
             with self.moriio_wrapper.lock:
                 self._recving_transfers[request_id][layer_name] = statuses
                 self._recving_transfers_start.setdefault(request_id, time.monotonic())
-                # Destination blocks, kept for _record_failed_recv.
-                if self._has_mamba:
-                    failed_recv_blocks = local_attn
-                else:
-                    failed_recv_blocks = [
-                        block_id for group in local_block_ids for block_id in group
-                    ]
+                # Preserve cache-group identity until completion so a failed
+                # hybrid read can be recomputed from the earliest bad group.
                 self._recving_local_blocks.setdefault(
-                    request_id, list(failed_recv_blocks)
+                    request_id,
+                    tuple(set(group) for group in local_block_ids),
                 )
                 # Awaited before the forward when the per-layer barrier cannot
                 # run (see _await_reads_issued_this_step).

@@ -3310,19 +3310,27 @@ class Scheduler(SchedulerInterface):
         affected_req_ids: set[str] = set()
         for req_id in failed_req_ids:
             request = self.requests.get(req_id)
-            if (
-                request is not None
-                and request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+            if request is None or request.status not in (
+                RequestStatus.WAITING_FOR_REMOTE_KVS,
+                RequestStatus.RUNNING,
             ):
-                affected_req_ids.add(req_id)
-                if self.recompute_kv_load_failures:
-                    request.num_computed_tokens = self._request_recompute_boundary(
-                        request,
-                        failed_block_ids_by_req.get(req_id, ()),
-                        num_scheduled_tokens,
-                    )
+                continue
+
+            if self.recompute_kv_load_failures:
+                request.num_computed_tokens = self._request_recompute_boundary(
+                    request,
+                    failed_block_ids_by_req.get(req_id, ()),
+                    num_scheduled_tokens,
+                )
+                if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                     self.failed_recving_kv_req_ids.add(req_id)
-        return set() if self.recompute_kv_load_failures else affected_req_ids
+                else:
+                    # A synchronous load already entered this model step.
+                    # Discard its output and recompute the invalid suffix.
+                    affected_req_ids.add(req_id)
+            else:
+                affected_req_ids.add(req_id)
+        return affected_req_ids
 
     def _handle_invalid_blocks(
         self, invalid_block_ids: set[int], num_scheduled_tokens: dict[str, int]
