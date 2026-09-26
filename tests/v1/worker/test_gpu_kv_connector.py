@@ -8,8 +8,10 @@ import pytest
 import torch
 
 import vllm.v1.worker.gpu.kv_connector as kv_connector_module
-from vllm.config import KVTransferConfig
+from vllm.config import KVTransferConfig, VllmConfig
+from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorTransferResults
+from vllm.forward_context import get_forward_context
 from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector
 
 
@@ -97,3 +99,24 @@ def test_no_forward_starts_deferred_load_once(monkeypatch: pytest.MonkeyPatch):
     connector.no_forward(_scheduler_output(False))  # type: ignore[arg-type]
 
     assert events == ["handle", "bind", "start", "clear"]
+
+
+@pytest.mark.parametrize("mode", [CUDAGraphMode.NONE, CUDAGraphMode.FULL])
+def test_load_outside_forward_preserves_graph_mode(monkeypatch, mode):
+    """FULL replay has no Python layer hooks, so connectors must wait up front."""
+    connector = _make_connector(monkeypatch, [])
+    connector.vllm_config = VllmConfig()
+    monkeypatch.setattr(
+        kv_connector_module, "is_forward_context_available", lambda: False
+    )
+    monkeypatch.setattr(kv_connector_module, "get_forward_context", get_forward_context)
+    observed = []
+    connector.kv_connector.start_load_kv.side_effect = lambda context, **_: (
+        observed.append(context.cudagraph_runtime_mode)
+    )
+
+    connector.pre_forward(_scheduler_output(True), cudagraph_runtime_mode=mode)
+
+    assert observed == [mode]
+    connector.no_forward(_scheduler_output(False))
+    assert observed == [mode, CUDAGraphMode.NONE]

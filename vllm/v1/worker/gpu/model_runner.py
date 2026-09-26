@@ -1948,7 +1948,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # because they are already copied to the CUDA graph input buffers.
             assert self.cudagraph_manager is not None
             self.kv_connector.pre_forward(
-                **connector_kwargs, attn_metadata=attn_metadata
+                **connector_kwargs,
+                attn_metadata=attn_metadata,
+                cudagraph_runtime_mode=batch_desc.cg_mode,
             )
             model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:

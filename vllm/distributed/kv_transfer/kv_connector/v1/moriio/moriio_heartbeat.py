@@ -15,9 +15,8 @@ import zmq
 logger = logging.getLogger(__name__)
 
 
-def terminate_with_parent() -> None:
+def terminate_with_parent(parent_pid: int) -> None:
     """Ask Linux to terminate this helper if its worker parent exits."""
-    parent_pid = os.getppid()
     libc = ctypes.CDLL(None, use_errno=True)
     if libc.prctl(1, signal.SIGTERM) != 0:  # PR_SET_PDEATHSIG
         errno = ctypes.get_errno()
@@ -38,11 +37,13 @@ def build_payload(args: argparse.Namespace) -> dict[str, object]:
 
 
 def run_heartbeat(args: argparse.Namespace) -> None:
-    terminate_with_parent()
+    terminate_with_parent(args.parent_pid)
     payload = msgpack.dumps(build_payload(args))
     context = zmq.Context()
     try:
         with context.socket(zmq.DEALER) as socket:
+            socket.setsockopt(zmq.LINGER, 0)
+            socket.setsockopt(zmq.SNDTIMEO, 1000)
             socket.connect(args.proxy_address)
             failures = 0
             while True:
@@ -65,6 +66,7 @@ def run_heartbeat(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--parent-pid", type=int, required=True)
     parser.add_argument("--proxy-address", required=True)
     parser.add_argument("--role", choices=("P", "D"), required=True)
     parser.add_argument("--http-address", required=True)

@@ -21,6 +21,7 @@ This file only keeps the MoE-shaped integration angle for those helpers.
 import importlib
 import math
 import warnings
+from types import SimpleNamespace
 from typing import Any, NamedTuple
 
 import pytest
@@ -430,6 +431,61 @@ def _run_fused_moe(
 
 
 # Custom op tests ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("separate_owner", ["lane", "stream"])
+def test_moe_stage2_reserves_maximum_and_reuses_across_shapes(
+    monkeypatch, separate_owner
+):
+    """Scratch stays fixed after warmup without aliasing concurrent owners."""
+    from aiter import ActivationType
+
+    from vllm import _aiter_ops
+    from vllm.v1.worker import workspace as workspace_module
+
+    fm = importlib.import_module("aiter.fused_moe")
+    captured = []
+    manager = workspace_module.WorkspaceManager(torch.device("cpu"), num_lanes=2)
+    stream = SimpleNamespace(cuda_stream=1)
+    monkeypatch.setattr(workspace_module, "current_workspace_manager", lambda: manager)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+    monkeypatch.setattr(
+        _aiter_ops.rocm_aiter_ops, "fused_moe_supports_stage2_workspace", lambda: True
+    )
+
+    def fused(hidden, *args, **kwargs):
+        captured.append(kwargs["stage2_workspace"])
+        return hidden
+
+    monkeypatch.setattr(fm, "fused_moe", fused)
+
+    def call(rows):
+        hidden = torch.zeros((rows, 8), dtype=torch.bfloat16)
+        return _aiter_ops._rocm_aiter_fused_moe_impl(
+            hidden,
+            torch.empty(3, 4, 8),
+            torch.empty(3, 8, 2),
+            torch.ones(rows, 2),
+            torch.zeros(rows, 2, dtype=torch.int32),
+            activation_method=ActivationType.Situv2.value,
+            max_num_tokens=8,
+        )
+
+    call(4)
+    if separate_owner == "lane":
+        with workspace_module.use_workspace_lane(1):
+            call(4)
+    else:
+        stream.cuda_stream = 2
+        call(4)
+        stream.cuda_stream = 1
+    manager.lock()
+    call(3)
+    assert captured[0].numel() == 8 * 2 * 8 * 2
+    assert captured[0] is captured[2]
+    assert captured[0].data_ptr() != captured[1].data_ptr()
+    with pytest.raises(ValueError, match="reserved token budget"):
+        call(9)
 
 
 def test_aiter_fused_moe_custom_op_registered():

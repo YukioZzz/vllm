@@ -432,6 +432,7 @@ def rocm_aiter_fused_experts(
             shared_w1_scale=shared_w1_scale,
             shared_w2_scale=shared_w2_scale,
             shared_expert_id=shared_expert_id,
+            max_num_tokens=moe_config.max_num_tokens,
         )
 
 

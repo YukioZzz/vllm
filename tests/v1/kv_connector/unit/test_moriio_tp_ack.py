@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     MoRIIOMode,
     MoRIIOTransferAck,
@@ -454,6 +455,26 @@ def test_hybrid_step_barrier_fails_closed(monkeypatch):
         worker._await_reads_issued_this_step()
 
 
+@pytest.mark.parametrize("mode", [CUDAGraphMode.NONE, CUDAGraphMode.FULL])
+def test_full_graph_waits_for_attention_and_mamba_reads(monkeypatch, mode):
+    attention, mamba = object(), object()
+    waited: list[object] = []
+    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker._reads_issued_this_step = [attention, mamba]
+    worker._mamba_reads_this_step = [mamba]
+    worker.moriio_wrapper = SimpleNamespace(
+        waiting_for_transfer_complete=waited.extend, shutdown=lambda: None
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector.get_forward_context",
+        lambda: SimpleNamespace(cudagraph_runtime_mode=mode),
+    )
+
+    worker._await_reads_issued_this_step()
+
+    assert waited == ([attention, mamba] if mode == CUDAGraphMode.FULL else [mamba])
+
+
 def test_requested_cudagraph_mode_is_never_overridden():
     # The configured cudagraph mode is always honored: the barrier fires when
     # the operator sets cudagraph_mode=PIECEWISE, and READ mode with full
@@ -464,3 +485,39 @@ def test_requested_cudagraph_mode_is_never_overridden():
     assert (
         MoRIIOConnector.requires_piecewise_for_cudagraph({"read_mode": False}) is False
     )
+
+
+@pytest.mark.parametrize("has_reads", [False, True])
+def test_read_submission_waits_for_destination_gpu_writes(monkeypatch, has_reads):
+    """RDMA must not race stream-queued zeroing or Mamba state migration."""
+    from queue import Queue
+
+    events = []
+    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker.is_producer = False
+    worker.mode = MoRIIOMode.READ
+    worker.moriio_config = SimpleNamespace(transfer_timeout=1)
+    worker._eager_handshaked_engines = {"prefill:6301"}
+    worker._ready_requests = Queue()
+    worker.load_ready_flag = set()
+    worker._reqs_to_send = {}
+    worker._eager_handshake_all_dp_ranks = lambda _: None
+    worker._read_blocks_for_req = lambda *_: events.append("read")
+    worker._await_reads_issued_this_step = lambda: events.append("wait")
+    monkeypatch.setattr(
+        "torch.cuda.current_stream",
+        lambda: SimpleNamespace(synchronize=lambda: events.append("gpu-ready")),
+    )
+    metadata = SimpleNamespace(
+        transfer_id_to_request_id={},
+        reqs_to_recv={
+            "req": SimpleNamespace(remote_host="prefill", remote_handshake_port=6301)
+        }
+        if has_reads
+        else {},
+        reqs_to_send={},
+    )
+
+    worker.start_load_kv(metadata)
+
+    assert events == (["gpu-ready", "read", "wait"] if has_reads else ["wait"])

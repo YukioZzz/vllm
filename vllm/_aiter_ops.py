@@ -345,6 +345,7 @@ def _rocm_aiter_fused_moe_impl(
     shared_w1_scale: torch.Tensor | None = None,
     shared_w2_scale: torch.Tensor | None = None,
     shared_expert_id: int = -1,
+    max_num_tokens: int = 0,
 ) -> torch.Tensor:
     has_shared_expert = _validate_rocm_aiter_fused_moe_shared_expert_args(
         shared_w1,
@@ -377,6 +378,32 @@ def _rocm_aiter_fused_moe_impl(
             shared_w1_scale=shared_w1_scale,
             shared_w2_scale=shared_w2_scale,
             shared_expert_id=shared_expert_id,
+        )
+
+    if (
+        max_num_tokens > 0
+        and not has_shared_expert
+        and activation == getattr(ActivationType, "Situv2", None)
+        and rocm_aiter_ops.fused_moe_supports_stage2_workspace()
+    ):
+        from vllm.v1.worker.workspace import current_workspace_manager
+
+        if hidden_states.shape[0] > max_num_tokens:
+            raise ValueError("AITER MoE input exceeds the reserved token budget")
+        topk, model_dim = topk_ids.shape[1], w2.shape[1]
+        dtype = output_dtype or hidden_states.dtype
+        # Private scratch must not alias the modular MoE or attention workspace.
+        # The manager also separates target/draft lanes and DBO microbatches.
+        extra_kwargs["stage2_workspace"] = current_workspace_manager().get_persistent(
+            (
+                "aiter-moe-stage2",
+                torch.cuda.current_stream().cuda_stream,
+                topk,
+                model_dim,
+                dtype,
+            ),
+            (max_num_tokens * topk * model_dim * dtype.itemsize,),
+            torch.uint8,
         )
 
     return fused_moe(
@@ -435,6 +462,7 @@ def _rocm_aiter_fused_moe_fake(
     shared_w1_scale: torch.Tensor | None = None,
     shared_w2_scale: torch.Tensor | None = None,
     shared_expert_id: int = -1,
+    max_num_tokens: int = 0,
 ) -> torch.Tensor:
     if output_dtype is not None:
         return torch.empty_like(hidden_states, dtype=output_dtype)
@@ -2434,6 +2462,16 @@ class rocm_aiter_ops:
 
         return "gate_mode" in inspect.signature(fused_moe).parameters
 
+    @classmethod
+    @if_aiter_supported
+    @functools.cache
+    def fused_moe_supports_stage2_workspace(cls) -> bool:
+        import inspect
+
+        from aiter.fused_moe import fused_moe
+
+        return "stage2_workspace" in inspect.signature(fused_moe).parameters
+
     @staticmethod
     def _probe_dsv4_i384_fhmoe_capability(num_tokens: int) -> bool:
         """Probe AITER's CSV-backed DSV4 native-I384 FHMoE contract."""
@@ -2954,6 +2992,7 @@ class rocm_aiter_ops:
         shared_w1_scale: torch.Tensor | None = None,
         shared_w2_scale: torch.Tensor | None = None,
         shared_expert_id: int = -1,
+        max_num_tokens: int = 0,
     ) -> torch.Tensor:
         return torch.ops.vllm.rocm_aiter_fused_moe(
             hidden_states,
@@ -2985,6 +3024,7 @@ class rocm_aiter_ops:
             shared_w1_scale,
             shared_w2_scale,
             shared_expert_id,
+            max_num_tokens,
         )
 
     @staticmethod

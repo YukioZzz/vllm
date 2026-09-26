@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from vllm.config import VllmConfig
+from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
     has_kv_transfer_group,
@@ -83,11 +84,18 @@ class ActiveKVConnector(KVConnector):
         load_kwargs = self._pending_load_kwargs
         assert load_kwargs is not None
         self._pending_load_kwargs = None
+        cudagraph_runtime_mode = load_kwargs.pop(
+            "cudagraph_runtime_mode", CUDAGraphMode.NONE
+        )
         # TODO: sort out KV Connectors' use of forward_context
         if is_forward_context_available():
             self.kv_connector.start_load_kv(get_forward_context(), **load_kwargs)
         else:
-            with set_forward_context(None, self.vllm_config):
+            with set_forward_context(
+                None,
+                self.vllm_config,
+                cudagraph_runtime_mode=cudagraph_runtime_mode,
+            ):
                 self.kv_connector.start_load_kv(get_forward_context(), **load_kwargs)
 
     def finish_forward(self) -> None:

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
 import math
+import os
 import queue
 import subprocess
 import sys
@@ -10,6 +11,7 @@ import time
 from collections import defaultdict
 from collections.abc import Collection
 from concurrent.futures import Future, ThreadPoolExecutor
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import msgpack
@@ -1883,8 +1885,9 @@ class MoRIIOConnectorWorker:
         self._ping_process = subprocess.Popen(
             [
                 sys.executable,
-                "-m",
-                "vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_heartbeat",
+                str(Path(__file__).with_name("moriio_heartbeat.py")),
+                "--parent-pid",
+                str(os.getpid()),
                 "--proxy-address",
                 f"tcp://{self.proxy_ip}:{self.proxy_ping_port}",
                 "--role",
@@ -3048,6 +3051,11 @@ class MoRIIOConnectorWorker:
             return
         if self.mode == MoRIIOMode.WRITE:
             return
+
+        if metadata.reqs_to_recv:
+            # CPU-posted RDMA does not inherit the compute stream's ordering.
+            # Finish destination zeroing/state copies before the NIC writes KV.
+            torch.cuda.current_stream().synchronize()
 
         # Handshake every referenced remote prefill rank up front, before any
         # read enters the forward pass. A lazy per-rank handshake on the read
