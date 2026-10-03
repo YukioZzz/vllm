@@ -191,6 +191,7 @@ def chunk_kda_prefill(
         o = out
     if scatter_to is not None:
         assert state_indices is not None
-        scatter_to[state_indices.long()] = final_state
+        assert final_state is not None
+        scatter_to[state_indices.long()] = final_state.to(scatter_to.dtype)
         return o, None
     return o, final_state

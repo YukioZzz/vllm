@@ -67,7 +67,9 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         if self.model_config is None or self.cache_config is None:
             raise ValueError("model_config and cache_config must be set")
         return MambaStateDtypeCalculator.kda_state_dtype(
-            self.model_config.dtype, self.cache_config.mamba_cache_dtype
+            self.model_config.dtype,
+            self.cache_config.mamba_cache_dtype,
+            self.cache_config.mamba_ssm_cache_dtype,
         )
 
     def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -154,7 +156,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         # ROCm can fuse the whole decode step (conv + recurrence + gated norm)
         # into one kernel, which wants a width-major fp32 conv weight staged at
         # load time. Everything else keeps the [channel, width] layout.
-        conv_state_dtype, _ = self.get_state_dtype()
+        conv_state_dtype, recurrent_state_dtype = self.get_state_dtype()
         decode_conv1d_weight = None
         if is_fused_kda_decode_supported(
             self.local_num_heads,
@@ -163,6 +165,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             self.num_spec,
             vllm_config.model_config.dtype,
             conv_state_dtype,
+            recurrent_state_dtype,
         ):
             logger.info_once("Fused KDA decode kernel (conv+KDA+norm) is enabled.")
             decode_conv1d_weight = torch.empty(
@@ -222,6 +225,12 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         self.use_fused_chunk = backend == "fused" or (
             backend == "auto" and is_fused_kda_chunk_supported()
         )
+        if recurrent_state_dtype != torch.float32:
+            if backend == "fused":
+                raise ValueError(
+                    "The fused KDA chunk kernel requires float32 SSM state"
+                )
+            self.use_fused_chunk = False
         logger.info_once(
             "Kimi-K3 KDA prefill backend: %s",
             "fused" if self.use_fused_chunk else "triton",

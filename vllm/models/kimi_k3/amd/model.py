@@ -64,6 +64,7 @@ class KimiK3ForConditionalGeneration(
 ):
     """Kimi-K3 model with Kimi-K2.5 vision and KimiLinear text."""
 
+    supports_aux_hidden_states_over_pp = True
     supports_encoder_tp_data = True
 
     hf_to_vllm_mapper = WeightsMapper(
