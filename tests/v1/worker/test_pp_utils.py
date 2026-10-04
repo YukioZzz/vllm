@@ -2,9 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Which rows the PP sampled-token broadcast must carry."""
 
+from collections import deque
 from unittest.mock import Mock
 
 import numpy as np
+import pytest
+import torch
 
 from vllm.v1.worker.gpu import pp_utils
 
@@ -166,3 +169,39 @@ def test_finishing_prefill_row_does_not_drop_a_sibling_row():
 
     assert mask is not None
     assert mask.tolist() == [False, True]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_draft_filter_preserves_live_rows_without_host_synchronization():
+    """A freed or non-sampling row must not stall PP's communication enqueue."""
+    device = torch.device("cuda")
+    handler = pp_utils.PPHandler.__new__(pp_utils.PPHandler)
+    handler.device = device
+    handler.main_stream = torch.cuda.current_stream()
+    handler.req_idx_gen_np = np.array([1, 0, 0, 0], dtype=np.int32)
+    mapping = np.array([2, 0, 3, 1], dtype=np.int32)
+    drafts = torch.tensor([[10, 11], [20, 21], [30, 31], [40, 41]], device=device)
+    event = torch.cuda.Event()
+    slot = pp_utils.PendingRecv(
+        event=event,
+        sampled_tokens=drafts,
+        num_sampled=torch.ones(4, dtype=torch.int32, device=device),
+        num_rejected=torch.zeros(4, dtype=torch.int32, device=device),
+        idx_mapping=torch.as_tensor(mapping, device=device),
+        idx_mapping_np=mapping,
+        need_sampled_mask=np.array([True, True, False, True]),
+        gen_at_receive_np=np.zeros(4, dtype=np.int32),
+        draft_tokens=drafts,
+    )
+    handler.queue = deque([slot])
+    output = torch.full((4, 2), -9, dtype=torch.int64, device=device)
+    event.record()
+    torch.accelerator.synchronize()
+    previous_debug_mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        result = handler.get_prev_sampled_outputs(output)
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_debug_mode)
+    assert output.tolist() == [[-9, -9], [40, 41], [10, 11], [-9, -9]]
+    assert result["idx_mapping"].tolist() == [2, -1, -1, 1]
