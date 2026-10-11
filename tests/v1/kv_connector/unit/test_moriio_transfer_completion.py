@@ -7,12 +7,16 @@ Covers the two behaviours the READ barrier depends on:
   * waiting_for_transfer_complete blocks until terminal and raises on failure.
 """
 
+import gc
 import importlib
 import importlib.util
 import threading
 import time
+import weakref
+from contextlib import contextmanager
 
 import pytest
+import zmq
 
 from vllm.platforms import current_platform
 
@@ -127,3 +131,29 @@ def test_wait_blocks_until_terminal():
         assert time.monotonic() - start >= 0.15
     finally:
         timer.cancel()
+
+
+def test_shutdown_releases_idle_notification_listener(monkeypatch):
+    ready = threading.Event()
+
+    @contextmanager
+    def listener(*_):
+        with zmq.Context() as context, context.socket(zmq.ROUTER) as socket:
+            socket.bind_to_random_port("tcp://127.0.0.1")
+            ready.set()
+            yield socket
+
+    monkeypatch.setattr(moriio_engine, "zmq_ctx", listener)
+    wrapper = MoRIIOWrapper(moriio_engine=object())
+    wrapper.notify_port = 1  # The test context allocates its own free port.
+    wrapper.async_wait_reqid()
+    thread = wrapper.notify_thread
+    assert thread is not None
+    assert ready.wait(5)
+    wrapper.shutdown()
+    wrapper.shutdown()
+    assert not thread.is_alive()
+    reference = weakref.ref(wrapper)
+    del wrapper
+    gc.collect()
+    assert reference() is None

@@ -542,6 +542,7 @@ class MoRIIOWrapper:
         self._terminal_transfer_ids: OrderedDict[TransferId, None] = OrderedDict()
         self._transfer_timeout = transfer_timeout
         self.notify_thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
         self.sessions: list[IOEngine.Session] = []
         self.paths: dict[str, zmq.Socket] = {}
 
@@ -748,10 +749,13 @@ class MoRIIOWrapper:
             logger.info("Node starting to listen notify from path = %s", path)
 
             with zmq_ctx(zmq.ROUTER, path) as sock:
-                while True:
+                sock.setsockopt(zmq.RCVTIMEO, 1000)
+                while not self._stop_event.is_set():
                     try:
                         identity, msg = sock.recv_multipart()
                         self._handle_message(msg)
+                    except zmq.Again:
+                        continue
                     except Exception as e:
                         logger.error("Error processing message: %s", e)
                         raise HandshakeError(f"Error processing message: {e}") from e
@@ -931,6 +935,9 @@ class MoRIIOWrapper:
 
     def shutdown(self):
         logger.debug("Closing MoRIIOWrapper and cleaning up ZMQ sockets")
+        self._stop_event.set()
+        if self.notify_thread is not None:
+            self.notify_thread.join()
         for path, sock in self.paths.items():
             try:
                 sock.close(linger=0)
