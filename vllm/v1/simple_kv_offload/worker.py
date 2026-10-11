@@ -78,6 +78,11 @@ class SimpleCPUOffloadWorker:
         # Completed store events to report via build_connector_worker_meta
         self._completed_store_events: dict[int, int] = {}
 
+    def shutdown(self) -> None:
+        """Drain copies before the connector releases its cache tensors."""
+        if self._backend is not None:
+            self._backend.shutdown()
+
     def register_kv_caches(
         self,
         kv_caches: dict[str, torch.Tensor],

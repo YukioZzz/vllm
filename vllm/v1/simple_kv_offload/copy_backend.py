@@ -98,7 +98,10 @@ class DmaCopyBackend:
         if self._queue is not None:
             self._queue.put(None)
         if self._thread is not None:
-            self._thread.join(timeout=5.0)
+            self._thread.join()
+        for stream in (self._load_stream, self._store_stream):
+            if stream is not None:
+                stream.synchronize()
 
     @staticmethod
     def _copy_loop(

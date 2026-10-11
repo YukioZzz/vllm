@@ -74,6 +74,34 @@ def _make_worker(
     return SimpleCPUOffloadWorker(None, kv_cache_config, cpu_capacity_bytes)
 
 
+def test_connector_shutdown_drains_cpu_copies():
+    """Shutdown must finish queued DMA before releasing the cache owners."""
+    backend, gpu, cpu = _make_backend()
+    worker = _make_worker(None, cpu.numel())
+    worker._backend = backend
+    worker.gpu_kv_caches = {"k": gpu}
+    worker.cpu_kv_caches = {"k": cpu}
+    worker.load_stream = backend._load_stream
+    worker.store_stream = backend._store_stream
+    connector = object.__new__(SimpleCPUOffloadConnector)
+    connector.worker_handler = worker
+    try:
+        gpu.fill_(73)
+        torch.accelerator.synchronize()
+        backend.launch_copy(
+            list(range(NUM_BLOCKS)), list(range(NUM_BLOCKS)), True, 0, []
+        )
+        connector.shutdown()
+        assert backend._thread is not None and not backend._thread.is_alive()
+        assert worker.load_stream is not None and worker.load_stream.query()
+        assert worker.store_stream is not None and worker.store_stream.query()
+        assert torch.all(cpu == 73)
+        connector.shutdown()
+    finally:
+        backend.shutdown()
+        torch.accelerator.synchronize()
+
+
 def _make_backend() -> tuple[DmaCopyBackend, torch.Tensor, torch.Tensor]:
     gpu = {"k": torch.zeros((NUM_BLOCKS, BLOCK_BYTES), dtype=torch.int8, device="cuda")}
     cpu = {
