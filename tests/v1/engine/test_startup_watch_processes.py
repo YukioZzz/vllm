@@ -147,13 +147,21 @@ def test_engine_core_startup_threads_are_scoped_to_launch(
 
 
 @pytest.mark.parametrize(
-    ("is_rocm", "request_timeout", "manager_timeout", "process_timeout"),
+    (
+        "is_rocm",
+        "request_timeout",
+        "manager_timeout",
+        "resource_timeout",
+        "process_timeout",
+    ),
     [
-        (True, 0, 0, 15.0),
-        (True, 0, 7, 7),
-        (True, 0, None, None),
-        (False, 0, 0, 0),
-        (True, 7, 0, 0),
+        (True, 0, 0, None, 15),
+        (True, 0, 0, 180, 180),
+        (True, 0, 7, 180, 7),
+        (True, 0, None, 180, None),
+        (False, 0, 0, 180, 0),
+        (True, 7, 0, 180, 0),
+        (True, None, 0, 180, 0),
     ],
 )
 def test_engine_core_process_shutdown_timeout(
@@ -161,8 +169,15 @@ def test_engine_core_process_shutdown_timeout(
     is_rocm: bool,
     request_timeout: float | None,
     manager_timeout: float | None,
+    resource_timeout: int | None,
     process_timeout: float | None,
 ):
+    if resource_timeout is None:
+        monkeypatch.delenv("VLLM_ROCM_ENGINE_SHUTDOWN_TIMEOUT_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv(
+            "VLLM_ROCM_ENGINE_SHUTDOWN_TIMEOUT_SECONDS", str(resource_timeout)
+        )
     manager = object.__new__(CoreEngineProcManager)
     manager._request_shutdown_timeout = request_timeout
     manager.manager_stopped = Event()

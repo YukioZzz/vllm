@@ -40,7 +40,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 STARTUP_POLL_PERIOD_MS = 10000
-ROCM_ENGINE_PROCESS_SHUTDOWN_TIMEOUT_S = 15.0
 
 
 def get_engine_process_shutdown_timeout(
@@ -62,7 +61,7 @@ def get_engine_process_shutdown_timeout(
     because EngineCore relies on that deadline to enforce request draining.
     """
     if request_timeout == 0 and process_timeout == 0 and current_platform.is_rocm():
-        return ROCM_ENGINE_PROCESS_SHUTDOWN_TIMEOUT_S
+        return envs.VLLM_ROCM_ENGINE_SHUTDOWN_TIMEOUT_SECONDS
     return process_timeout
 
 
