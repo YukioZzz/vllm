@@ -26,6 +26,7 @@ from tests.v1.kv_connector.unit.test_kv_connector_lifecycle import (
     _make_empty_scheduler_output,
 )
 from vllm.config import CacheConfig
+from vllm.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload_connector import (
     SimpleCPUOffloadConnector,
 )
@@ -119,6 +120,42 @@ def _make_backend() -> tuple[DmaCopyBackend, torch.Tensor, torch.Tensor]:
         torch.cuda.Stream(priority=low_pri),
     )
     return backend, gpu["k"], cpu["k"]
+
+
+def test_shutdown_unregisters_owned_cpu_cache():
+    size = NUM_BLOCKS * BLOCK_BYTES
+    config = KVCacheConfig(
+        num_blocks=NUM_BLOCKS,
+        kv_cache_tensors=[KVCacheTensor(size, ["k"], size, BLOCK_BYTES)],
+        kv_cache_groups=[],
+    )
+    worker = _make_worker(config, 1024 * 1024)
+    gpu = {"k": torch.zeros((NUM_BLOCKS, BLOCK_BYTES), dtype=torch.int8, device="cuda")}
+    worker.register_kv_caches(gpu)
+    assert worker.cpu_kv_caches is not None
+    cpu = worker.cpu_kv_caches["k"]
+    try:
+        assert cpu.is_pinned()
+        worker.shutdown()
+        assert not cpu.is_pinned()
+        worker.shutdown()
+    finally:
+        assert worker._backend is not None
+        worker._backend.shutdown()
+        if cpu.is_pinned():
+            runtime = CudaRTLibrary()
+            assert runtime.cudaHostUnregister(cpu.data_ptr()) == 0
+
+
+def test_failed_copy_drain_is_not_treated_as_completed_shutdown():
+    backend = DmaCopyBackend()
+    stream = MagicMock()
+    stream.synchronize.side_effect = [RuntimeError("copy not drained"), None]
+    backend._load_stream = stream
+    with pytest.raises(RuntimeError, match="copy not drained"):
+        backend.shutdown()
+    backend.shutdown()
+    assert stream.synchronize.call_count == 2
 
 
 @pytest.mark.parametrize("use_v2", [False, True])

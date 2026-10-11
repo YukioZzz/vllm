@@ -10,7 +10,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend
-from vllm.v1.simple_kv_offload.cuda_mem_ops import pin_tensor
+from vllm.v1.simple_kv_offload.cuda_mem_ops import pin_tensor, unpin_tensor
 from vllm.v1.simple_kv_offload.disk_backend import DiskBackend
 from vllm.v1.simple_kv_offload.metadata import (
     SimpleCPUOffloadMetadata,
@@ -48,6 +48,7 @@ class SimpleCPUOffloadWorker:
 
         self.gpu_kv_caches: dict[str, torch.Tensor] | None = None
         self.cpu_kv_caches: dict[str, torch.Tensor] | None = None
+        self._pinned_cpu_tensors: list[torch.Tensor] = []
         self.device: torch.device | None = None
         self.num_cpu_blocks: int = 0
 
@@ -79,9 +80,12 @@ class SimpleCPUOffloadWorker:
         self._completed_store_events: dict[int, int] = {}
 
     def shutdown(self) -> None:
-        """Drain copies before the connector releases its cache tensors."""
+        """Drain copies and unregister owned CPU buffers before releasing them."""
         if self._backend is not None:
             self._backend.shutdown()
+        while self._pinned_cpu_tensors:
+            unpin_tensor(self._pinned_cpu_tensors[-1])
+            self._pinned_cpu_tensors.pop()
 
     def register_kv_caches(
         self,
@@ -237,6 +241,7 @@ class SimpleCPUOffloadWorker:
             tensor = torch.zeros(cpu_shape, dtype=gpu_tensor.dtype, device="cpu")
             if pin_memory:
                 pin_tensor(tensor)
+                self._pinned_cpu_tensors.append(tensor)
             self.cpu_kv_caches[name] = tensor
 
         self._backend = DmaCopyBackend()

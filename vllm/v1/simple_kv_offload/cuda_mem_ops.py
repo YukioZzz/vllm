@@ -33,6 +33,16 @@ def pin_tensor(tensor: torch.Tensor) -> None:
         raise RuntimeError(f"cudaHostRegister failed: {err}")
 
 
+def unpin_tensor(tensor: torch.Tensor) -> None:
+    """Release a manual registration after all device copies have completed."""
+    from vllm.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
+
+    runtime = CudaRTLibrary()
+    error = runtime.cudaHostUnregister(tensor.data_ptr())
+    if error != 0:
+        raise RuntimeError(f"cudaHostUnregister failed: {error}")
+
+
 class _CUmemLocation(ctypes.Structure):
     _fields_ = [("type", ctypes.c_uint), ("id", ctypes.c_int)]
 

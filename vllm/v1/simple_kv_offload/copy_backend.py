@@ -94,7 +94,6 @@ class DmaCopyBackend:
     def shutdown(self) -> None:
         if self._shutdown:
             return
-        self._shutdown = True
         if self._queue is not None:
             self._queue.put(None)
         if self._thread is not None:
@@ -102,6 +101,7 @@ class DmaCopyBackend:
         for stream in (self._load_stream, self._store_stream):
             if stream is not None:
                 stream.synchronize()
+        self._shutdown = True
 
     @staticmethod
     def _copy_loop(
