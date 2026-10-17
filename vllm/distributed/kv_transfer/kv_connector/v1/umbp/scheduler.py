@@ -477,13 +477,20 @@ class UMBPStoreConnectorScheduler:
             need_to_load = matched_units * self._lookup_units[group_id]
             block_hashes_by_group: tuple[tuple[bytes | None, ...], ...] = ()
         else:
-            need_to_load, block_hashes_by_group = self._coordinate_external_hits(
-                list(context.hashes),
-                num_computed_tokens,
-                max_external_token - num_computed_tokens,
-                logical_objects_by_group,
-                logical_hits_by_group,
+            need_to_load, block_hashes_by_group, uncached_common = (
+                self._coordinate_external_hits(
+                    list(context.hashes),
+                    num_computed_tokens,
+                    max_external_token - num_computed_tokens,
+                    logical_objects_by_group,
+                    logical_hits_by_group,
+                )
             )
+            if uncached_common:
+                request.shared_prefix_boundary = max(
+                    request.shared_prefix_boundary,
+                    num_computed_tokens + need_to_load + uncached_common,
+                )
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "UMBP lookup result request=%s keys=%s group_hits=%s load_tokens=%d",
@@ -526,7 +533,7 @@ class UMBPStoreConnectorScheduler:
         max_external_tokens: int,
         logical_objects_by_group: dict[int, list[tuple[bytes, tuple[str, ...]]]],
         logical_hits_by_group: dict[int, list[bool]],
-    ) -> tuple[int, tuple[tuple[bytes | None, ...], ...]]:
+    ) -> tuple[int, tuple[tuple[bytes | None, ...], ...], int]:
         """Apply the core KV cache coordinator to runtime lookup results."""
         coordinator = self._lookup_coordinator
         assert coordinator is not None
@@ -545,9 +552,11 @@ class UMBPStoreConnectorScheduler:
                 for group_id in self.kv_cache_config.prefix_cacheable_group_ids
             ]
             skipped_hashes = local_tokens // self.hash_block_size
-            hit_blocks, hit_length, _ = coordinator.find_longest_cache_hit(
-                cast(list[BlockHash], request_hashes)[skipped_hashes:],
-                max_external_tokens,
+            hit_blocks, hit_length, uncached_common = (
+                coordinator.find_longest_cache_hit(
+                    cast(list[BlockHash], request_hashes)[skipped_hashes:],
+                    max_external_tokens,
+                )
             )
             block_hashes_by_group = tuple(
                 tuple(
@@ -558,7 +567,7 @@ class UMBPStoreConnectorScheduler:
                 )
                 for group_blocks in hit_blocks
             )
-            return hit_length, block_hashes_by_group
+            return hit_length, block_hashes_by_group, uncached_common
         finally:
             self._reset_lookup_coordinator()
 

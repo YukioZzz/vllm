@@ -57,6 +57,42 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
 
+@pytest.mark.parametrize("local", [0, 16])
+@pytest.mark.parametrize("lookup_async", [False, True])
+@pytest.mark.parametrize("existing_boundary", [0, 48])
+def test_external_attention_prefix_teaches_missing_state_boundary(
+    local, lookup_async, existing_boundary
+):
+    codec = BlockIdentityCodec(UMBPNamespace("shared-prefix"))
+    hashes = [b"a", b"b", b"c", b"d"]
+    hits = {codec.key(h, 0): True for h in hashes[:2]}
+    scheduler = UMBPStoreConnectorScheduler(
+        _vllm_config({"mode": "embedded", "lookup_async": lookup_async}),
+        _hybrid_kv_cache_config(),
+        _SchedulerHandle(hits),
+        codec,
+    )
+    request = make_request(
+        "branch",
+        block_hashes=hashes,
+        num_tokens=65,
+        shared_prefix_boundary=existing_boundary,
+    )
+    try:
+        result = scheduler.get_num_new_matched_tokens(request, local)
+        if result[0] is None:
+            assert request.shared_prefix_boundary == existing_boundary
+            scheduler._pending_lookups[request.request_id].future.result(timeout=5)
+            result = scheduler.get_num_new_matched_tokens(request, local)
+        # Missing recurrent state is not a cache hit. Preserve only the hint
+        # that core can use when computing and retaining the branch checkpoint.
+        assert result == (0, False)
+        assert request.shared_prefix_boundary == max(32, existing_boundary)
+        assert request.request_id not in scheduler._load_specs
+    finally:
+        scheduler.close()
+
+
 def test_mamba_align_states_store_only_from_boundary_handoffs():
     """Positional Mamba blocks may be live or speculative; only core's
     boundary hand-offs name a committed state block."""

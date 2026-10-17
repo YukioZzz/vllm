@@ -315,6 +315,7 @@ def make_request(request_id: str = "req", **overrides) -> SimpleNamespace:
         "num_prompt_tokens": num_prompt_tokens,
         "num_computed_tokens": 0,
         "num_in_flight_tokens": 0,
+        "shared_prefix_boundary": 0,
         "block_hashes": [b"a", b"b"],
         "block_ids": ([1, 2],),
         "prompt_token_ids": list(range(num_prompt_tokens)),
